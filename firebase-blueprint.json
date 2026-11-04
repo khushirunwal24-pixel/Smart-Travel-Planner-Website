@@ -1,0 +1,107 @@
+{
+  "entities": {
+    "User": {
+      "title": "User Profile",
+      "description": "User profile information",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Unique user ID matching auth.uid" },
+        "email": { "type": "string", "format": "email", "description": "User email address" },
+        "displayName": { "type": "string", "maxLength": 100, "description": "User display name" },
+        "photoURL": { "type": "string", "maxLength": 500, "description": "User avatar URL" },
+        "createdAt": { "type": "string", "description": "Creation timestamp" },
+        "updatedAt": { "type": "string", "description": "Last update timestamp" }
+      },
+      "required": ["uid", "email"]
+    },
+    "Trip": {
+      "title": "Trip",
+      "description": "Travel trip details and metadata",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "Owner user ID" },
+        "title": { "type": "string", "maxLength": 150, "description": "Trip name or title" },
+        "startLocation": { "type": "string", "maxLength": 150, "description": "Starting departure city or location" },
+        "destination": { "type": "string", "maxLength": 150, "description": "Primary destination" },
+        "startDate": { "type": "string", "description": "Trip start date (YYYY-MM-DD)" },
+        "endDate": { "type": "string", "description": "Trip end date (YYYY-MM-DD)" },
+        "travelers": { "type": "number", "description": "Number of travelers" },
+        "budget": { "type": "number", "description": "Total estimated budget" },
+        "travelPreferences": { "type": "string", "maxLength": 300, "description": "Comma separated travel preferences" },
+        "travelMode": { "type": "string", "enum": ["flight", "train", "bus", "car"], "description": "Primary mode of transport" },
+        "accommodation": { "type": "string", "maxLength": 100, "description": "Preferred stay type" },
+        "status": { "type": "string", "enum": ["planning", "active", "completed", "cancelled"], "description": "Trip status" },
+        "createdAt": { "type": "string", "description": "Creation timestamp" },
+        "updatedAt": { "type": "string", "description": "Last update timestamp" }
+      },
+      "required": ["userId", "title", "startLocation", "destination", "startDate", "endDate", "travelers", "budget"]
+    },
+    "Itinerary": {
+      "title": "Itinerary",
+      "description": "Generated day-wise travel schedule for a trip",
+      "type": "object",
+      "properties": {
+        "tripId": { "type": "string", "description": "Associated Trip ID" },
+        "userId": { "type": "string", "description": "Owner user ID" },
+        "destination": { "type": "string", "maxLength": 150, "description": "Destination name" },
+        "totalDays": { "type": "number", "description": "Number of days in the itinerary" },
+        "daysJson": { "type": "string", "maxLength": 50000, "description": "JSON serialized day itinerary cards and spots" },
+        "createdAt": { "type": "string", "description": "Creation timestamp" },
+        "updatedAt": { "type": "string", "description": "Last update timestamp" }
+      },
+      "required": ["tripId", "userId", "destination", "totalDays", "daysJson"]
+    },
+    "Expense": {
+      "title": "Expense",
+      "description": "Travel budget expense item",
+      "type": "object",
+      "properties": {
+        "tripId": { "type": "string", "description": "Associated Trip ID" },
+        "userId": { "type": "string", "description": "Owner user ID" },
+        "title": { "type": "string", "maxLength": 150, "description": "Expense title or item name" },
+        "amount": { "type": "number", "description": "Expense monetary amount" },
+        "category": { "type": "string", "enum": ["Transport", "Accommodation", "Food", "Activities", "Shopping", "Other"], "description": "Budget category" },
+        "date": { "type": "string", "description": "Date of transaction" },
+        "notes": { "type": "string", "maxLength": 500, "description": "Optional notes or receipt notes" },
+        "createdAt": { "type": "string", "description": "Creation timestamp" },
+        "updatedAt": { "type": "string", "description": "Last update timestamp" }
+      },
+      "required": ["tripId", "userId", "title", "amount", "category", "date"]
+    },
+    "Preference": {
+      "title": "Preference",
+      "description": "Traveler saved preferences",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "Owner user ID" },
+        "favoriteCategories": { "type": "string", "maxLength": 300, "description": "Favorite categories" },
+        "defaultCurrency": { "type": "string", "maxLength": 10, "description": "Preferred currency" },
+        "dietaryPreferences": { "type": "string", "maxLength": 200, "description": "Dietary notes" },
+        "updatedAt": { "type": "string", "description": "Last update timestamp" }
+      },
+      "required": ["userId"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "User" },
+      "description": "Private user profile and metadata"
+    },
+    "/trips/{tripId}": {
+      "schema": { "$ref": "Trip" },
+      "description": "User created travel trips"
+    },
+    "/itineraries/{itineraryId}": {
+      "schema": { "$ref": "Itinerary" },
+      "description": "Trip day-by-day itineraries"
+    },
+    "/expenses/{expenseId}": {
+      "schema": { "$ref": "Expense" },
+      "description": "Trip expense records"
+    },
+    "/preferences/{preferenceId}": {
+      "schema": { "$ref": "Preference" },
+      "description": "User travel preferences"
+    }
+  }
+}

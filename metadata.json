@@ -1,0 +1,6 @@
+{
+  "name": "Smart Travel Planner",
+  "description": "An Intelligent Trip Planning & Budget Management Platform for Travelers. Plan personalized itineraries, manage budgets, explore interactive route maps, and track live weather.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

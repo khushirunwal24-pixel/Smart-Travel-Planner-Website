@@ -1,0 +1,73 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Default deny all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // User profiles
+    match /users/{userId} {
+      allow read, write: if isValidId(userId) && isOwner(userId);
+    }
+
+    // Trips collection
+    match /trips/{tripId} {
+      allow get, delete: if isValidId(tripId) && isSignedIn() && resource.data.userId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isValidId(tripId) && isSignedIn() && request.resource.data.userId == request.auth.uid;
+      allow update: if isValidId(tripId) && isSignedIn() 
+        && resource.data.userId == request.auth.uid 
+        && request.resource.data.userId == request.auth.uid;
+    }
+
+    // Itineraries collection
+    match /itineraries/{itineraryId} {
+      allow get, delete: if isValidId(itineraryId) && isSignedIn() && resource.data.userId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isValidId(itineraryId) && isSignedIn() && request.resource.data.userId == request.auth.uid;
+      allow update: if isValidId(itineraryId) && isSignedIn() 
+        && resource.data.userId == request.auth.uid 
+        && request.resource.data.userId == request.auth.uid;
+    }
+
+    // Expenses collection
+    match /expenses/{expenseId} {
+      allow get, delete: if isValidId(expenseId) && isSignedIn() && resource.data.userId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isValidId(expenseId) && isSignedIn() && request.resource.data.userId == request.auth.uid;
+      allow update: if isValidId(expenseId) && isSignedIn() 
+        && resource.data.userId == request.auth.uid 
+        && request.resource.data.userId == request.auth.uid;
+    }
+
+    // Preferences collection
+    match /preferences/{preferenceId} {
+      allow get, delete: if isValidId(preferenceId) && isSignedIn() && resource.data.userId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isValidId(preferenceId) && isSignedIn() && request.resource.data.userId == request.auth.uid;
+      allow update: if isValidId(preferenceId) && isSignedIn() 
+        && resource.data.userId == request.auth.uid 
+        && request.resource.data.userId == request.auth.uid;
+    }
+
+    // Connection test document
+    match /test/connection {
+      allow read: if true;
+    }
+  }
+}
