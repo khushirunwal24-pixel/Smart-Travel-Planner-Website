@@ -993,6 +993,8 @@ export const TripPlanner: React.FC<TripPlannerProps> = ({
                       Source:{' '}
                       {discoveryResult.source === 'mongodb-cache'
                         ? 'Worldwide MongoDB Atlas/Local Catalog (Multi-Source)'
+                        : discoveryResult.source === 'server-cache'
+                        ? 'Server Discovery Cache (OpenStreetMap / Open Data)'
                         : discoveryResult.source === 'multi-source'
                         ? 'Multi-Source (TravelType + Wikidata + OpenStreetMap)'
                         : discoveryResult.source === 'openstreetmap-overpass'
@@ -1189,11 +1191,13 @@ export const TripPlanner: React.FC<TripPlannerProps> = ({
                             <h4 className="font-bold text-sm text-slate-900 leading-snug">
                               {attr.name}
                             </h4>
-                            {(attr.city || attr.country) && (
+                            {(attr.locality || attr.city || attr.country) && (
                               <p className="text-[10px] text-slate-500 flex items-center gap-1 mt-0.5">
                                 <Globe className="w-2.5 h-2.5 shrink-0" />
                                 <span>
-                                  {[attr.city, attr.country].filter(Boolean).join(', ')}
+                                  {Array.from(
+                                    new Set([attr.locality, attr.city, attr.country].filter(Boolean))
+                                  ).join(', ')}
                                 </span>
                               </p>
                             )}

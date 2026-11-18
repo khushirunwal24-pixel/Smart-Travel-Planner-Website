@@ -787,6 +787,15 @@ export function placeToDiscoveredAttraction(
   const osmTags: Record<string, string> = {
     ...(place.sourceMetadata?.osm?.tags || {}),
   };
+  const locality: string | undefined =
+    place.sourceMetadata?.osm?.locality ||
+    osmTags['addr:suburb'] ||
+    osmTags['addr:neighbourhood'] ||
+    osmTags['addr:district'] ||
+    undefined;
+  const address: string | undefined =
+    place.sourceMetadata?.osm?.address ||
+    ([osmTags['addr:street'], locality, place.city].filter(Boolean).join(', ') || undefined);
 
   return {
     id: place.sourceIds?.osmCompositeId || place.placeId,
@@ -797,6 +806,8 @@ export function placeToDiscoveredAttraction(
     subcategory: place.subcategory || undefined,
     tags: place.tags?.length ? place.tags : undefined,
     city: place.city || center?.name || undefined,
+    locality,
+    address,
     country: place.country || center?.country || undefined,
     countryCode: place.countryCode || undefined,
     lat: place.latitude,

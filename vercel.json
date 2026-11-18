@@ -5,7 +5,8 @@
   "outputDirectory": "dist",
   "functions": {
     "api/index.ts": {
-      "includeFiles": "ml/artifacts/**"
+      "includeFiles": "ml/artifacts/**",
+      "maxDuration": 30
     }
   },
   "rewrites": [

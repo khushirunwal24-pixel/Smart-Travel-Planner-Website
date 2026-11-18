@@ -24,9 +24,13 @@ import {
 } from './places/normalizer.js';
 import { fetchTravelTypeAttractions } from './places/adapters/traveltypeAdapter.js';
 import { fetchWikidataAttractions } from './places/adapters/wikidataAdapter.js';
-import { fetchOsmAttractions } from './places/adapters/osmAdapter.js';
+import { fetchOsmAttractions, getOsmOverpassSettings } from './places/adapters/osmAdapter.js';
 import { fetchOpenTripMapAttractions } from './places/adapters/opentripmapAdapter.js';
-import { parseJsonResponseSafely } from './places/httpClient.js';
+import {
+  fetchWithTimeoutAndRetry,
+  parseJsonResponseSafely,
+  parseRetryAfterMs,
+} from './places/httpClient.js';
 import { rankAttractionsWithModel } from './ml/ranker.js';
 
 export const OVERPASS_FALLBACK_SERVERS = [
@@ -105,11 +109,36 @@ const overpassCache = new Map<
   string,
   CacheEntry<{ attractions: DiscoveredAttraction[]; foodVenues: FoodVenue[]; endpointUsed: string }>
 >();
+interface DiscoveryCacheEntry {
+  destinationInfo: GeoCoordinates;
+  attractions: DiscoveredAttraction[];
+  searchRadiusMeters: number;
+  endpointUsed: string;
+  source: string;
+  cachedAt: number;
+  freshUntil: number;
+  staleUntil: number;
+}
+const discoveryResultCache = new Map<string, DiscoveryCacheEntry>();
 const osrmCache = new Map<string, CacheEntry<RouteSegmentResult>>();
 
 const GEOCODE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const OVERPASS_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
 const OSRM_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
+
+export function getDiscoveryCacheTtlMs(): number {
+  const rawSeconds = Number(process.env.DISCOVERY_CACHE_TTL_SECONDS || 21600);
+  if (!Number.isFinite(rawSeconds)) return 6 * 60 * 60 * 1000;
+  return Math.max(60, Math.min(86400, Math.round(rawSeconds))) * 1000;
+}
+
+export function clearDiscoveryCache(): void {
+  discoveryResultCache.clear();
+}
+
+export function getDiscoveryCacheStats(): { entries: number } {
+  return { entries: discoveryResultCache.size };
+}
 
 // ---------- Rate Limiters & Queues ----------
 let overpassQueue: Promise<unknown> = Promise.resolve();
@@ -259,10 +288,14 @@ export function validateAndNormalizeDestination(raw: unknown): DestinationValida
 }
 
 // ---------- 1. Open-Meteo + Nominatim Geocoding ----------
-async function geocodeViaNominatim(cleanedQuery: string): Promise<GeoCoordinates | null> {
+async function geocodeViaNominatim(
+  cleanedQuery: string,
+  cityQuery: string,
+  regionHint = ''
+): Promise<GeoCoordinates | null> {
   const nominatimUrl = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(
     cleanedQuery
-  )}&format=jsonv2&addressdetails=1&limit=5`;
+  )}&format=jsonv2&addressdetails=1&limit=6`;
 
   try {
     const res = await fetch(nominatimUrl, {
@@ -298,19 +331,40 @@ async function geocodeViaNominatim(cleanedQuery: string): Promise<GeoCoordinates
     const rows = parsed.data;
     if (!Array.isArray(rows) || rows.length === 0) return null;
 
+    const targetLower = cityQuery.toLowerCase();
+    const scoreRow = (r: (typeof rows)[number]): number => {
+      let score = r.importance || 0;
+      const nameLower = (r.name || '').toLowerCase();
+      const displayLower = (r.display_name || '').toLowerCase();
+      const countryLower = (r.address?.country || '').toLowerCase();
+      const stateLower = (r.address?.state || '').toLowerCase();
+
+      if (nameLower === targetLower) score += 0.5;
+      if (regionHint) {
+        if (
+          countryLower.includes(regionHint) ||
+          stateLower.includes(regionHint) ||
+          displayLower.includes(regionHint)
+        ) {
+          score += 1.2;
+        }
+      }
+      if (
+        r.addresstype === 'city' ||
+        r.addresstype === 'town' ||
+        r.addresstype === 'state' ||
+        r.addresstype === 'region' ||
+        r.addresstype === 'state_district' ||
+        r.addresstype === 'administrative'
+      ) {
+        score += 0.45;
+      }
+      return score;
+    };
+
     const scored = [...rows]
       .filter((r) => !isNaN(parseFloat(r.lat)) && !isNaN(parseFloat(r.lon)))
-      .sort((a, b) => {
-        const aCityBoost =
-          a.addresstype === 'city' || a.addresstype === 'town' || a.addresstype === 'state_district'
-            ? 0.5
-            : 0;
-        const bCityBoost =
-          b.addresstype === 'city' || b.addresstype === 'town' || b.addresstype === 'state_district'
-            ? 0.5
-            : 0;
-        return (b.importance || 0) + bCityBoost - ((a.importance || 0) + aCityBoost);
-      });
+      .sort((a, b) => scoreRow(b) - scoreRow(a));
 
     if (scored.length === 0) return null;
     const best = scored[0];
@@ -319,6 +373,7 @@ async function geocodeViaNominatim(cleanedQuery: string): Promise<GeoCoordinates
       best.address?.city ||
       best.address?.town ||
       best.address?.village ||
+      best.address?.state ||
       cleanedQuery.split(',')[0].trim();
     const admin1 = best.address?.state || best.address?.state_district;
     const country = best.address?.country;
@@ -331,6 +386,7 @@ async function geocodeViaNominatim(cleanedQuery: string): Promise<GeoCoordinates
       admin1,
       lat: parseFloat(best.lat),
       lng: parseFloat(best.lon),
+      placeType: best.addresstype,
     };
   } catch {
     return null;
@@ -399,49 +455,97 @@ export async function geocodeDestination(
     openMeteoResults = undefined;
   }
 
+  let bestOpenMeteo: {
+    result: GeoCoordinates;
+    matchesRegionHint: boolean;
+    population: number;
+    exactName: boolean;
+  } | null = null;
+
   if (openMeteoResults && openMeteoResults.length > 0) {
-    // Score matches: region hint match + population prominence + city feature priority
     const scored = openMeteoResults
       .map((item) => {
         let score = 0;
         const itemName = (item.name || '').toLowerCase();
         const itemCountry = (item.country || '').toLowerCase();
         const itemAdmin1 = (item.admin1 || '').toLowerCase();
+        const matchesRegionHint = Boolean(
+          regionHint && (itemCountry.includes(regionHint) || itemAdmin1.includes(regionHint))
+        );
+        const exactName = itemName === cityQuery.toLowerCase();
 
-        if (itemName === cityQuery.toLowerCase()) score += 100;
-        if (regionHint) {
-          if (itemCountry.includes(regionHint) || itemAdmin1.includes(regionHint)) {
-            score += 200;
-          }
-        }
+        if (exactName) score += 100;
+        if (matchesRegionHint) score += 200;
         if (item.feature_code?.startsWith('PPL')) score += 40;
         if (item.population) {
           score += Math.min(80, Math.log10(Math.max(10, item.population)) * 12);
         }
-        return { item, score };
+        return { item, score, matchesRegionHint, exactName };
       })
       .sort((a, b) => b.score - a.score);
 
-    const best = scored[0].item;
+    const top = scored[0];
+    const best = top.item;
     const displayParts = [best.name, best.admin1, best.country].filter(Boolean);
-    const result: GeoCoordinates = {
-      name: best.name,
-      displayName: Array.from(new Set(displayParts)).join(', '),
-      country: best.country,
-      admin1: best.admin1,
-      lat: best.latitude,
-      lng: best.longitude,
+    bestOpenMeteo = {
+      result: {
+        name: best.name,
+        displayName: Array.from(new Set(displayParts)).join(', '),
+        country: best.country,
+        admin1: best.admin1,
+        lat: best.latitude,
+        lng: best.longitude,
+        placeType: best.feature_code,
+      },
+      matchesRegionHint: top.matchesRegionHint,
+      population: best.population || 0,
+      exactName: top.exactName,
     };
 
-    geocodeCache.set(cacheKey, { data: result, expiresAt: Date.now() + GEOCODE_TTL_MS });
-    return result;
+    // Immediate accept only when regionHint is satisfied (or absent with a major populated city >= 50k)
+    if (
+      (!regionHint || bestOpenMeteo.matchesRegionHint) &&
+      bestOpenMeteo.exactName &&
+      bestOpenMeteo.population >= 50000
+    ) {
+      geocodeCache.set(cacheKey, {
+        data: bestOpenMeteo.result,
+        expiresAt: Date.now() + GEOCODE_TTL_MS,
+      });
+      return bestOpenMeteo.result;
+    }
   }
 
-  // Fallback to Nominatim for valid destination names missed or failed by Open-Meteo
-  const nominatimResult = await geocodeViaNominatim(cleaned);
+  // Consult Nominatim when Open-Meteo missed the regionHint (e.g. "Goa, India" — Open-Meteo lacks Indian states),
+  // returned only a small town (<50k pop), or returned zero results.
+  const nominatimResult = await geocodeViaNominatim(cleaned, cityQuery, regionHint);
   if (nominatimResult) {
-    geocodeCache.set(cacheKey, { data: nominatimResult, expiresAt: Date.now() + GEOCODE_TTL_MS });
-    return nominatimResult;
+    const nominatimMatchesHint = Boolean(
+      regionHint &&
+        `${nominatimResult.displayName} ${nominatimResult.country || ''} ${nominatimResult.admin1 || ''}`
+          .toLowerCase()
+          .includes(regionHint)
+    );
+    const preferNominatim =
+      !bestOpenMeteo ||
+      (regionHint && !bestOpenMeteo.matchesRegionHint && nominatimMatchesHint) ||
+      (!bestOpenMeteo.exactName &&
+        nominatimResult.name.toLowerCase() === cityQuery.toLowerCase()) ||
+      (bestOpenMeteo.population < 50000 &&
+        ['state', 'region', 'city', 'administrative'].includes(nominatimResult.placeType || ''));
+
+    if (preferNominatim) {
+      geocodeCache.set(cacheKey, { data: nominatimResult, expiresAt: Date.now() + GEOCODE_TTL_MS });
+      return nominatimResult;
+    }
+  }
+
+  if (bestOpenMeteo) {
+    geocodeCache.set(cacheKey, {
+      data: bestOpenMeteo.result,
+      expiresAt: Date.now() + GEOCODE_TTL_MS,
+    });
+    return bestOpenMeteo.result;
   }
 
   if (openMeteoHttpError !== null) {
@@ -474,6 +578,7 @@ export interface EndpointAttempt {
   endpoint: string;
   status: number | 'timeout' | 'network-error';
   message: string;
+  retryAfterSeconds?: number;
 }
 
 export class OverpassError extends Error {
@@ -736,16 +841,19 @@ async function runSingleOverpassRequest(
       );
     }
 
-    // Respect sequential spacing between Overpass queries (>= 1.5s)
+    // Respect sequential spacing between Overpass queries (>= 800ms)
     const elapsedSinceLast = now - lastOverpassRequestAt;
-    if (elapsedSinceLast < 1500) {
-      await sleep(1500 - elapsedSinceLast);
+    if (elapsedSinceLast < 800) {
+      await sleep(800 - elapsedSinceLast);
     }
     lastOverpassRequestAt = Date.now();
 
-    const executeFetch = async (): Promise<Response> => {
-      const body = new URLSearchParams({ data: query }).toString();
-      return fetchWithTimeout(
+    const { timeoutMs, maxRetries, baseBackoffMs } = getOsmOverpassSettings();
+    const body = new URLSearchParams({ data: query }).toString();
+
+    let response: Response;
+    try {
+      response = await fetchWithTimeoutAndRetry(
         overpassUrl,
         {
           method: 'POST',
@@ -756,99 +864,48 @@ async function runSingleOverpassRequest(
           },
           body,
         },
-        4500
-      );
-    };
-
-    const parseOverpassOrThrow = async (res: Response): Promise<{ elements: OsmElement[]; endpointUsed: string }> => {
-      const parsed = await parseJsonResponseSafely<{ elements?: OsmElement[]; remark?: string }>(
-        res,
-        'Overpass API',
-        overpassUrl
-      );
-      if (!parsed.ok) {
-        if (parsed.isRateLimited) {
-          overpassRateLimitUntil.set(overpassUrl, Date.now() + 30_000);
-          throw new OverpassError(parsed.error, 429, 30, true);
+        {
+          timeoutMs,
+          maxRetries,
+          baseBackoffMs,
+          retryOnTimeout: false,
+          maxRetryAfterWaitMs: allowRetryAfterPause ? 2500 : 1000,
+          onRetryAfter: (retryAfterMs) => {
+            overpassRateLimitUntil.set(
+              overpassUrl,
+              Date.now() + Math.min(120_000, Math.max(5_000, retryAfterMs))
+            );
+          },
         }
-        throw new OverpassError(
-          parsed.error,
-          parsed.isTimeout ? 504 : 502,
-          undefined,
-          false
-        );
-      }
-      if (!Array.isArray(parsed.data.elements)) {
-        throw new OverpassError(
-          `Overpass API (${overpassUrl}) returned JSON without an elements array (Content-Type: ${parsed.contentType}).`,
-          502,
-          undefined,
-          false
-        );
-      }
-      return { elements: parsed.data.elements, endpointUsed: overpassUrl };
-    };
-
-    let response: Response;
-    try {
-      response = await executeFetch();
+      );
     } catch (err: any) {
-      const isTimeout = err?.name === 'AbortError' || err?.name === 'TimeoutError';
+      const isTimeout =
+        err?.name === 'AbortError' ||
+        err?.name === 'TimeoutError' ||
+        /timed out|aborted/i.test(err?.message || '');
       throw new OverpassError(
         isTimeout
-          ? `Overpass provider (${overpassUrl}) timed out after 4.5s.`
+          ? `Overpass provider (${overpassUrl}) timed out after ${Math.round(timeoutMs / 1000)}s.`
           : `Unable to reach Overpass provider (${overpassUrl}): ${err?.message || 'Network error'}.`,
-        504,
+        isTimeout ? 504 : 503,
         undefined,
         false
       );
     }
 
-    // Retry once quickly on transient 502/503/504 errors
-    if (response.status === 502 || response.status === 503 || response.status === 504) {
-      await sleep(500);
-      try {
-        response = await executeFetch();
-      } catch {
-        throw new OverpassError(
-          `Overpass server (${overpassUrl}) timed out on retry (HTTP ${response.status}).`,
-          504,
-          undefined,
-          false
-        );
-      }
-    }
-
-    // Handle 429 or 406 with a mandatory minimum 30-second pause
     if (response.status === 429 || response.status === 406) {
-      const pauseMs = 30_000;
-      overpassRateLimitUntil.set(overpassUrl, Date.now() + pauseMs);
-
-      if (allowRetryAfterPause) {
-        await sleep(pauseMs);
-        lastOverpassRequestAt = Date.now();
-        const retryResponse = await executeFetch();
-        if (retryResponse.ok) {
-          return await parseOverpassOrThrow(retryResponse);
-        }
-        if (retryResponse.status === 429 || retryResponse.status === 406) {
-          overpassRateLimitUntil.set(overpassUrl, Date.now() + pauseMs);
-          throw new OverpassError(
-            `Overpass API returned HTTP ${retryResponse.status} after the 30-second pause. Please wait 30 seconds or switch to another OSM-compatible Overpass provider.`,
-            retryResponse.status,
-            30,
-            true
-          );
-        }
-        response = retryResponse;
-      } else {
-        throw new OverpassError(
-          `Overpass API (${overpassUrl}) returned HTTP ${response.status}. A 30-second pause is required before retrying this server.`,
-          response.status,
-          30,
-          true
-        );
-      }
+      const retryAfterMs = parseRetryAfterMs(response.headers.get('retry-after')) || 30_000;
+      const pauseSec = Math.max(1, Math.ceil(retryAfterMs / 1000));
+      overpassRateLimitUntil.set(
+        overpassUrl,
+        Date.now() + Math.min(120_000, Math.max(5_000, retryAfterMs))
+      );
+      throw new OverpassError(
+        `Overpass API (${overpassUrl}) returned HTTP ${response.status} (Retry-After: ${pauseSec}s).`,
+        response.status,
+        pauseSec,
+        true
+      );
     }
 
     if (!response.ok) {
@@ -865,7 +922,32 @@ async function runSingleOverpassRequest(
       throw new OverpassError(hint, response.status, undefined, false);
     }
 
-    return await parseOverpassOrThrow(response);
+    const parsed = await parseJsonResponseSafely<{ elements?: OsmElement[]; remark?: string }>(
+      response,
+      'Overpass API',
+      overpassUrl
+    );
+    if (!parsed.ok) {
+      if (parsed.isRateLimited) {
+        overpassRateLimitUntil.set(overpassUrl, Date.now() + 30_000);
+        throw new OverpassError(parsed.error, 429, 30, true);
+      }
+      throw new OverpassError(
+        parsed.error,
+        parsed.isTimeout ? 504 : 502,
+        undefined,
+        false
+      );
+    }
+    if (!Array.isArray(parsed.data.elements)) {
+      throw new OverpassError(
+        `Overpass API (${overpassUrl}) returned JSON without an elements array (Content-Type: ${parsed.contentType}).`,
+        502,
+        undefined,
+        false
+      );
+    }
+    return { elements: parsed.data.elements, endpointUsed: overpassUrl };
   });
 }
 
@@ -2235,6 +2317,14 @@ export async function discoverAttractionsForDestination(input: {
   tripDays?: number;
   userId?: string;
   forceRefresh?: boolean;
+  providersOverride?: {
+    geocode?: typeof geocodeDestination;
+    fetchTravelType?: typeof fetchTravelTypeAttractions;
+    fetchWikidata?: typeof fetchWikidataAttractions;
+    fetchOsm?: typeof fetchOsmAttractions;
+    fetchOpenTripMap?: typeof fetchOpenTripMapAttractions;
+    fetchLegacyWiki?: typeof discoverFromWikidataAndWikipedia;
+  };
 }): Promise<{
   destinationInfo: GeoCoordinates;
   attractions: DiscoveredAttraction[];
@@ -2253,23 +2343,99 @@ export async function discoverAttractionsForDestination(input: {
   queryGroupId?: string;
 }> {
   const config = resolveApiConfig(input);
-  const destGeo = await geocodeDestination(input.destination, config.openMeteoGeocodeUrl);
-  const radius = Math.max(3000, Math.min(45000, input.radiusMeters || 12000));
-  const { query } = buildOverpassQuery(destGeo, radius);
+  const requestedRadius = Math.max(3000, Math.min(45000, input.radiusMeters || 12000));
+  const normalizedDestKey = input.destination.trim().toLowerCase().replace(/\s+/g, ' ');
+  const destCacheKey = `dest:${normalizedDestKey}|${requestedRadius}`;
   const queryGroupId = `qry_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+  const ttlMs = getDiscoveryCacheTtlMs();
+  const staleWindowMs = Math.max(ttlMs * 4, 24 * 60 * 60 * 1000);
 
   const prefTokens = (input.travelPreferences || '')
     .split(/[,;/]+/)
     .map((s) => s.trim())
     .filter(Boolean);
 
-  const rankContext = {
-    preferences: prefTokens,
-    budget: input.budget,
-    travelers: input.travelers,
-    tripDays: input.tripDays,
-    center: destGeo,
-  };
+  const buildRankResult = async (pool: DiscoveredAttraction[], center: GeoCoordinates) =>
+    rankAttractionsWithModel(
+      pool,
+      {
+        preferences: prefTokens,
+        budget: input.budget,
+        travelers: input.travelers,
+        tripDays: input.tripDays,
+        center,
+      },
+      { userId: input.userId }
+    );
+
+  // Fast fresh server-side discovery cache hit before geocoding/external network calls
+  if (!input.forceRefresh) {
+    const freshEntry = discoveryResultCache.get(destCacheKey);
+    if (freshEntry && freshEntry.freshUntil > Date.now() && freshEntry.attractions.length > 0) {
+      const ranked = await buildRankResult(freshEntry.attractions, freshEntry.destinationInfo);
+      return {
+        destinationInfo: freshEntry.destinationInfo,
+        attractions: ranked.attractions.slice(0, 60),
+        searchRadiusMeters: freshEntry.searchRadiusMeters,
+        overpassEndpointUsed: `${freshEntry.endpointUsed} (cached)`,
+        fallbacksTried: [freshEntry.endpointUsed],
+        source: 'server-cache',
+        attempts: [
+          {
+            endpoint: 'server:discovery-cache',
+            status: 200,
+            message: `Served ${freshEntry.attractions.length} cached verified attractions (TTL ${Math.round(ttlMs / 1000)}s)`,
+          },
+        ],
+        modelStatus: ranked.modelStatus,
+        queryGroupId,
+      };
+    }
+  }
+
+  const geocodeFn = input.providersOverride?.geocode || geocodeDestination;
+  const destGeo = await geocodeFn(input.destination, config.openMeteoGeocodeUrl);
+
+  // States and regions (e.g. Goa, India) span broader territory than a single city core
+  const isBroadRegion =
+    destGeo.placeType === 'state' ||
+    destGeo.placeType === 'region' ||
+    destGeo.placeType === 'administrative';
+  const radius =
+    !input.radiusMeters && isBroadRegion ? Math.max(requestedRadius, 35000) : requestedRadius;
+  const coordCacheKey = `coord:${destGeo.lat.toFixed(2)},${destGeo.lng.toFixed(2)}|${radius}`;
+  const { query } = buildOverpassQuery(destGeo, radius);
+
+  // Check coordinate-bucket server cache if destination phrasing differed (e.g. "Goa" vs "Goa, India")
+  if (!input.forceRefresh) {
+    const freshCoord = discoveryResultCache.get(coordCacheKey);
+    if (freshCoord && freshCoord.freshUntil > Date.now() && freshCoord.attractions.length > 0) {
+      const ranked = await buildRankResult(freshCoord.attractions, destGeo);
+      return {
+        destinationInfo: destGeo,
+        attractions: ranked.attractions.slice(0, 60),
+        searchRadiusMeters: radius,
+        overpassEndpointUsed: `${freshCoord.endpointUsed} (cached)`,
+        fallbacksTried: [freshCoord.endpointUsed],
+        source: 'server-cache',
+        attempts: [
+          {
+            endpoint: 'server:discovery-cache',
+            status: 200,
+            message: `Served ${freshCoord.attractions.length} cached verified attractions`,
+          },
+        ],
+        modelStatus: ranked.modelStatus,
+        queryGroupId,
+      };
+    }
+  }
+
+  const ttFn = input.providersOverride?.fetchTravelType || fetchTravelTypeAttractions;
+  const wdFn = input.providersOverride?.fetchWikidata || fetchWikidataAttractions;
+  const osmFn = input.providersOverride?.fetchOsm || fetchOsmAttractions;
+  const otmFn = input.providersOverride?.fetchOpenTripMap || fetchOpenTripMapAttractions;
+  const legacyWikiFn = input.providersOverride?.fetchLegacyWiki || discoverFromWikidataAndWikipedia;
 
   try {
     await connectToMongoDB().catch(() => null);
@@ -2295,15 +2461,21 @@ export async function discoverAttractionsForDestination(input: {
     } else {
       // Backfill concurrently from independent free sources (TravelType + Wikidata + OSM + optional OpenTripMap)
       const [ttRes, wdRes, osmRes, otmRes] = await Promise.all([
-        fetchTravelTypeAttractions(destGeo, {
+        ttFn(destGeo, {
           radiusKm: Math.max(15, Math.round(radius / 1000) + 10),
           limit: 35,
-        }).catch((e) => ({ candidates: [] as NormalizedPlaceCandidate[], error: e?.message || 'TravelType failed' })),
-        fetchWikidataAttractions(destGeo, {
+        }).catch((e) => ({
+          candidates: [] as NormalizedPlaceCandidate[],
+          error: e?.message || 'TravelType failed',
+        })),
+        wdFn(destGeo, {
           radiusKm: Math.max(10, Math.round(radius / 1000)),
           limit: 65,
-        }).catch((e) => ({ candidates: [] as NormalizedPlaceCandidate[], error: e?.message || 'Wikidata failed' })),
-        fetchOsmAttractions(destGeo, {
+        }).catch((e) => ({
+          candidates: [] as NormalizedPlaceCandidate[],
+          error: e?.message || 'Wikidata failed',
+        })),
+        osmFn(destGeo, {
           radiusMeters: radius,
           customOverpassUrl: input.customOverpassUrl,
           limit: 140,
@@ -2311,8 +2483,10 @@ export async function discoverAttractionsForDestination(input: {
           candidates: [] as NormalizedPlaceCandidate[],
           endpointUsed: undefined,
           error: e?.message || 'Overpass failed',
+          attempts: [] as EndpointAttempt[],
+          allRateLimited: false,
         })),
-        fetchOpenTripMapAttractions(destGeo, { radiusMeters: radius }).catch(() => ({
+        otmFn(destGeo, { radiusMeters: radius }).catch(() => ({
           candidates: [] as NormalizedPlaceCandidate[],
           enabled: false,
         })),
@@ -2354,20 +2528,31 @@ export async function discoverAttractionsForDestination(input: {
         });
       }
 
+      if (Array.isArray(osmRes.attempts) && osmRes.attempts.length > 0) {
+        for (const osmAttempt of osmRes.attempts) {
+          attempts.push(osmAttempt);
+          if (osmAttempt.endpoint && !fallbacksTried.includes(osmAttempt.endpoint)) {
+            fallbacksTried.push(osmAttempt.endpoint);
+          }
+        }
+      }
+
       if (osmRes.candidates.length > 0) {
         batchCandidates.push(...osmRes.candidates);
         activeSources.add('osm');
         const osmEp = osmRes.endpointUsed || config.overpassUrl;
-        fallbacksTried.push(osmEp);
-        attempts.push({
-          endpoint: osmEp,
-          status: 200,
-          message: `OpenStreetMap Overpass returned ${osmRes.candidates.length} places`,
-        });
-      } else if (osmRes.error) {
+        if (!fallbacksTried.includes(osmEp)) fallbacksTried.push(osmEp);
+        if (!osmRes.attempts?.some((a) => a.status === 200)) {
+          attempts.push({
+            endpoint: osmEp,
+            status: 200,
+            message: `OpenStreetMap Overpass returned ${osmRes.candidates.length} places`,
+          });
+        }
+      } else if (osmRes.error && (!osmRes.attempts || osmRes.attempts.length === 0)) {
         attempts.push({
           endpoint: config.overpassUrl,
-          status: 'timeout',
+          status: osmRes.allRateLimited ? 429 : 'timeout',
           message: osmRes.error,
         });
       }
@@ -2385,7 +2570,12 @@ export async function discoverAttractionsForDestination(input: {
 
       // Secondary Wikipedia GeoSearch supplement if primary providers combined gave < 10 places
       if (batchCandidates.length + existingMongo.length < 10) {
-        const legacyWiki = await discoverFromWikidataAndWikipedia(destGeo, radius);
+        const legacyWiki = await legacyWikiFn(destGeo, radius).catch(() => ({
+          attractions: [] as DiscoveredAttraction[],
+          endpointUsed: '',
+          source: 'wikipedia-geosearch',
+          attempts: [] as EndpointAttempt[],
+        }));
         attempts.push(...legacyWiki.attempts);
         if (legacyWiki.endpointUsed) fallbacksTried.push(legacyWiki.endpointUsed);
 
@@ -2420,14 +2610,64 @@ export async function discoverAttractionsForDestination(input: {
         if (refreshedMongo.length > 0) {
           attractionsPool = refreshedMongo;
         } else {
-          attractionsPool = upsertStats.places.map((p) => placeToDiscoveredAttraction(p, destGeo));
+          const directConverted = upsertStats.places.map((p) => placeToDiscoveredAttraction(p, destGeo));
+          attractionsPool =
+            existingMongo.length > 0
+              ? deduplicateAttractions([...existingMongo, ...directConverted])
+              : directConverted;
         }
       }
 
       if (attractionsPool.length === 0) {
+        // Stale-if-error fallback: reuse previously cached verified attractions before returning 503/429
+        const now = Date.now();
+        const staleEntry =
+          discoveryResultCache.get(destCacheKey) || discoveryResultCache.get(coordCacheKey);
+        if (staleEntry && staleEntry.staleUntil > now && staleEntry.attractions.length > 0) {
+          const rankedStale = await buildRankResult(staleEntry.attractions, destGeo);
+          return {
+            destinationInfo: destGeo,
+            attractions: rankedStale.attractions.slice(0, 60),
+            searchRadiusMeters: radius,
+            overpassEndpointUsed: `${staleEntry.endpointUsed} (stale-cache fallback)`,
+            fallbacksTried: [...fallbacksTried, 'server:discovery-cache'],
+            source: 'server-cache',
+            attempts: [
+              ...attempts,
+              {
+                endpoint: 'server:discovery-cache',
+                status: 200,
+                message: `Returned ${staleEntry.attractions.length} cached verified attractions after live provider failures`,
+              },
+            ],
+            coverageNotice:
+              'Live Overpass/open-data servers were temporarily unavailable, so cached verified attractions from an earlier query are shown. Click "Retry Discovery" later to refresh.',
+            modelStatus: rankedStale.modelStatus,
+            queryGroupId,
+          };
+        }
+
         // Check if every provider failed or if destination truly had 0 POIs
         const hadAny200 = attempts.some((a) => a.status === 200);
         if (!hadAny200 && attempts.length > 0) {
+          const isAllRateLimited =
+            Boolean(osmRes.allRateLimited) &&
+            attempts.every((a) => a.status === 429 || a.status === 406);
+          const maxRetryAfter = Math.max(
+            30,
+            ...attempts.map((a) => a.retryAfterSeconds || 0)
+          );
+          if (isAllRateLimited) {
+            throw new OverpassError(
+              `Attraction discovery rate-limited for ${destGeo.displayName}. Please wait ${maxRetryAfter}s before retrying.`,
+              429,
+              maxRetryAfter,
+              true,
+              destGeo,
+              query,
+              attempts
+            );
+          }
           throw new OverpassError(
             `All external attraction providers failed for ${destGeo.displayName}: ${attempts
               .map((a) => a.message)
@@ -2456,18 +2696,34 @@ export async function discoverAttractionsForDestination(input: {
     }
 
     // Rank all deduplicated attractions using the SINGLE attraction ranking model
-    const rankedResult = await rankAttractionsWithModel(attractionsPool, rankContext, {
-      userId: input.userId,
-    });
+    const rankedResult = await buildRankResult(attractionsPool, destGeo);
+    const sliced = rankedResult.attractions.slice(0, 60);
+
+    // Cache ONLY verified, non-empty results (never cache empty or failed results)
+    if (sliced.length > 0) {
+      const now = Date.now();
+      const entry: DiscoveryCacheEntry = {
+        destinationInfo: destGeo,
+        attractions: sliced,
+        searchRadiusMeters: radius,
+        endpointUsed,
+        source: dataSource,
+        cachedAt: now,
+        freshUntil: now + ttlMs,
+        staleUntil: now + staleWindowMs,
+      };
+      discoveryResultCache.set(destCacheKey, entry);
+      discoveryResultCache.set(coordCacheKey, entry);
+    }
 
     const coverageNotice =
-      rankedResult.attractions.length < 8
-        ? `Regional open-data coverage around ${destGeo.name} returned ${rankedResult.attractions.length} verified places within ${(radius / 1000).toFixed(0)} km. Expanding the search radius may uncover additional attractions.`
+      sliced.length < 8
+        ? `Regional open-data coverage around ${destGeo.name} returned ${sliced.length} verified places within ${(radius / 1000).toFixed(0)} km. Expanding the search radius may uncover additional attractions.`
         : undefined;
 
     return {
       destinationInfo: destGeo,
-      attractions: rankedResult.attractions.slice(0, 60),
+      attractions: sliced,
       searchRadiusMeters: radius,
       overpassEndpointUsed: endpointUsed,
       fallbacksTried,

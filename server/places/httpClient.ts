@@ -122,6 +122,22 @@ export function scheduleProviderRequest<T>(
   return next;
 }
 
+export function parseRetryAfterMs(headerValue: string | null): number {
+  if (!headerValue) return 0;
+  const trimmed = headerValue.trim();
+  if (!trimmed) return 0;
+
+  if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
+    return Math.max(0, Math.round(parseFloat(trimmed) * 1000));
+  }
+
+  const parsedDateMs = Date.parse(trimmed);
+  if (!Number.isNaN(parsedDateMs)) {
+    return Math.max(0, parsedDateMs - Date.now());
+  }
+  return 0;
+}
+
 export async function fetchWithTimeoutAndRetry(
   url: string,
   init: RequestInit = {},
@@ -129,11 +145,22 @@ export async function fetchWithTimeoutAndRetry(
     timeoutMs?: number;
     maxRetries?: number;
     baseBackoffMs?: number;
+    retryOnTimeout?: boolean;
+    maxRetryAfterWaitMs?: number;
+    onRetryAfter?: (retryAfterMs: number, status: number) => void;
   }
 ): Promise<Response> {
-  const timeoutMs = options?.timeoutMs ?? 8000;
-  const maxRetries = options?.maxRetries ?? 2;
-  const baseBackoffMs = options?.baseBackoffMs ?? 600;
+  const timeoutMs = Math.max(1000, options?.timeoutMs ?? 8000);
+  const maxRetries = Math.max(0, Math.min(3, options?.maxRetries ?? 2));
+  const baseBackoffMs = Math.max(100, options?.baseBackoffMs ?? 500);
+  const retryOnTimeout = options?.retryOnTimeout ?? true;
+  const maxRetryAfterWaitMs = Math.max(500, options?.maxRetryAfterWaitMs ?? 3000);
+
+  const computeJitteredDelay = (attempt: number, retryAfterMs = 0) => {
+    const exp = baseBackoffMs * Math.pow(2, attempt);
+    const jitter = Math.floor(Math.random() * Math.min(350, baseBackoffMs));
+    return Math.max(exp + jitter, retryAfterMs > 0 ? retryAfterMs + Math.floor(Math.random() * 150) : 0);
+  };
 
   let lastError: unknown;
 
@@ -145,29 +172,50 @@ export async function fetchWithTimeoutAndRetry(
         ...init,
         signal: controller.signal,
       });
-      clearTimeout(timer);
+
+      if (res.status === 429 || res.status === 406) {
+        const retryAfterMs = parseRetryAfterMs(res.headers.get('retry-after')) || 30_000;
+        options?.onRetryAfter?.(retryAfterMs, res.status);
+
+        // If Retry-After fits comfortably in a quick retry window, wait and retry;
+        // otherwise return immediately so sequential fallback moves to the next mirror.
+        if (attempt < maxRetries && retryAfterMs <= maxRetryAfterWaitMs) {
+          await sleep(computeJitteredDelay(attempt, retryAfterMs));
+          continue;
+        }
+        return res;
+      }
 
       if (
-        (res.status === 429 || res.status === 502 || res.status === 503 || res.status === 504) &&
+        (res.status === 502 || res.status === 503 || res.status === 504) &&
         attempt < maxRetries
       ) {
-        const retryAfter = Number(res.headers.get('retry-after') || '0');
-        const waitMs =
-          retryAfter > 0 && retryAfter <= 15
-            ? retryAfter * 1000
-            : baseBackoffMs * Math.pow(2, attempt);
-        await sleep(waitMs);
+        const retryAfterMs = parseRetryAfterMs(res.headers.get('retry-after'));
+        if (retryAfterMs > maxRetryAfterWaitMs) {
+          options?.onRetryAfter?.(retryAfterMs, res.status);
+          return res;
+        }
+        await sleep(computeJitteredDelay(attempt, retryAfterMs));
         continue;
       }
 
       return res;
-    } catch (err) {
-      clearTimeout(timer);
+    } catch (err: any) {
       lastError = err;
-      if (attempt < maxRetries) {
-        await sleep(baseBackoffMs * Math.pow(2, attempt));
+      const isAbort = err?.name === 'AbortError' || err?.name === 'TimeoutError';
+      if (attempt < maxRetries && (!isAbort || retryOnTimeout)) {
+        await sleep(computeJitteredDelay(attempt));
         continue;
       }
+      if (isAbort) {
+        const timeoutErr = new Error(
+          `Request to ${url} timed out after ${timeoutMs}ms`
+        );
+        timeoutErr.name = 'TimeoutError';
+        throw timeoutErr;
+      }
+    } finally {
+      clearTimeout(timer);
     }
   }
 

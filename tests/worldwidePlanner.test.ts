@@ -27,8 +27,15 @@ import {
 } from '../server/ml/ranker.js';
 import { sanitizeMongoUri } from '../server/db/connection.js';
 import { parseJsonResponseSafely } from '../server/places/httpClient.js';
-import { OSM_OVERPASS_MIRRORS } from '../server/places/adapters/osmAdapter.js';
-import { OVERPASS_FALLBACK_SERVERS } from '../server/travelEngine.js';
+import { fetchOsmAttractions, OSM_OVERPASS_MIRRORS } from '../server/places/adapters/osmAdapter.js';
+import {
+  clearDiscoveryCache,
+  discoverAttractionsForDestination,
+  geocodeDestination,
+  getDiscoveryCacheStats,
+  OVERPASS_FALLBACK_SERVERS,
+  OverpassError,
+} from '../server/travelEngine.js';
 import { parseBackendResponse } from '../src/services/aiPlannerService.js';
 import { app } from '../server.js';
 
@@ -468,4 +475,239 @@ test('8. Express /api/* returns JSON (never HTML) even on malformed JSON request
   const payload = (await malformedRes.json()) as any;
   assert.equal(payload.code, 'VALIDATION_ERROR');
 });
+
+test('9. Geocoding resolves "Goa, India" to Goa in India rather than Goa, Philippines', async () => {
+  const geo = await geocodeDestination(
+    'Goa, India',
+    'https://geocoding-api.open-meteo.com/v1/search'
+  );
+  assert.ok(
+    (geo.country || '').toLowerCase().includes('india') ||
+      geo.displayName.toLowerCase().includes('india'),
+    `Expected India in resolved Goa location, got: ${geo.displayName}`
+  );
+  assert.ok(
+    geo.lat >= 14.5 && geo.lat <= 16.0 && geo.lng >= 73.5 && geo.lng <= 74.6,
+    `Expected Goa India coordinates (~15.3, 74.1), got (${geo.lat}, ${geo.lng})`
+  );
+});
+
+test('10. Overpass adapter performs sequential mirror fallback on 429/504, extracts locality/address, and deduplicates', async () => {
+  let primaryHits = 0;
+  let secondaryHits = 0;
+
+  const mockServer = http.createServer((req, res) => {
+    if (req.url === '/primary') {
+      primaryHits += 1;
+      res.writeHead(429, {
+        'Content-Type': 'text/plain',
+        'Retry-After': '45',
+      });
+      res.end('Too Many Requests');
+      return;
+    }
+    if (req.url === '/timeout') {
+      res.writeHead(504, { 'Content-Type': 'text/plain' });
+      res.end('Gateway Timeout');
+      return;
+    }
+    if (req.url === '/fallback') {
+      secondaryHits += 1;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          elements: [
+            {
+              type: 'node',
+              id: 101,
+              lat: 15.4989,
+              lon: 73.8278,
+              tags: {
+                name: 'Basilica of Bom Jesus',
+                historic: 'basilica',
+                'addr:suburb': 'Old Goa',
+                'addr:street': 'Old Goa Road',
+                'addr:city': 'Panaji',
+                wikidata: 'Q810615',
+              },
+            },
+            {
+              type: 'way',
+              id: 102,
+              center: { lat: 15.4991, lon: 73.828 },
+              tags: {
+                name: 'Basilica of Bom Jesus',
+                historic: 'church',
+              },
+            },
+            {
+              type: 'node',
+              id: 103,
+              lat: 15.4922,
+              lon: 73.7733,
+              tags: {
+                name: 'Aguada Fort',
+                historic: 'fort',
+                'addr:locality': 'Candolim',
+                'addr:state': 'Goa',
+              },
+            },
+          ],
+        })
+      );
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  await new Promise<void>((resolve) => mockServer.listen(0, '127.0.0.1', () => resolve()));
+  const addr = mockServer.address() as { port: number };
+  const mockBase = `http://127.0.0.1:${addr.port}`;
+
+  try {
+    const result = await fetchOsmAttractions(
+      { name: 'Goa', displayName: 'Goa, India', country: 'India', lat: 15.49, lng: 73.82 },
+      {
+        endpointsOverride: [`${mockBase}/primary`, `${mockBase}/timeout`, `${mockBase}/fallback`],
+        timeoutMsOverride: 3000,
+        maxRetriesOverride: 0,
+      }
+    );
+
+    assert.equal(primaryHits, 1);
+    assert.equal(secondaryHits, 1);
+    assert.equal(result.endpointUsed, `${mockBase}/fallback`);
+    assert.equal(result.candidates.length, 2, 'Expected duplicate nearby Basilica of Bom Jesus to be merged');
+    const bom = result.candidates.find((c) => c.name === 'Basilica of Bom Jesus');
+    assert.ok(bom);
+    assert.equal(bom.sourceMetadata?.locality, 'Old Goa');
+    assert.ok(String(bom.sourceMetadata?.address || '').includes('Old Goa Road'));
+    assert.equal(result.attempts.length, 3);
+    assert.equal(result.attempts[0].status, 429);
+    assert.equal(result.attempts[0].retryAfterSeconds, 45);
+    assert.equal(result.attempts[1].status, 504);
+    assert.equal(result.attempts[2].status, 200);
+  } finally {
+    await new Promise<void>((resolve) => mockServer.close(() => resolve()));
+  }
+});
+
+test('11. Server discovery cache never caches failures, serves cached verified places on repeat & provider outage, and throws 503 when uncached', async () => {
+  clearDiscoveryCache();
+  await PlaceModel.deleteMany({ city: 'MockTestCity' });
+
+  const mockGeo = {
+    name: 'MockTestCity',
+    displayName: 'MockTestCity, India',
+    country: 'India',
+    lat: 15.3004,
+    lng: 74.0855,
+    placeType: 'state',
+  };
+
+  const emptyFailureProviders = {
+    geocode: async () => mockGeo,
+    fetchTravelType: async () => ({ candidates: [], error: 'TravelType 503' }),
+    fetchWikidata: async () => ({ candidates: [], error: 'Wikidata 504' }),
+    fetchOsm: async () => ({
+      candidates: [],
+      error: 'Overpass mirrors timed out',
+      attempts: [
+        {
+          endpoint: 'https://overpass-api.de/api/interpreter',
+          status: 'timeout' as const,
+          message: 'Timed out',
+        },
+        {
+          endpoint: 'https://overpass.kumi.systems/api/interpreter',
+          status: 503,
+          message: 'HTTP 503',
+        },
+      ],
+      allRateLimited: false,
+    }),
+    fetchOpenTripMap: async () => ({ candidates: [], enabled: false }),
+    fetchLegacyWiki: async () => ({
+      attractions: [],
+      endpointUsed: '',
+      source: 'wikipedia-geosearch' as const,
+      attempts: [],
+    }),
+  };
+
+  // 1) Uncached total outage must return structured 503 and NEVER populate cache
+  await assert.rejects(
+    () =>
+      discoverAttractionsForDestination({
+        destination: 'MockTestCity, India',
+        providersOverride: emptyFailureProviders,
+      }),
+    (err: any) => err instanceof OverpassError && err.statusCode === 503 && err.attempts.length >= 4
+  );
+  assert.equal(getDiscoveryCacheStats().entries, 0, 'Failed discovery must NOT be cached');
+
+  // 2) Live success populates cache and returns effective radius >= 35km for state destinations
+  let liveOsmCalls = 0;
+  const liveSuccessRes = await discoverAttractionsForDestination({
+    destination: 'MockTestCity, India',
+    providersOverride: {
+      ...emptyFailureProviders,
+      fetchOsm: async () => {
+        liveOsmCalls += 1;
+        return {
+          candidates: [
+            {
+              name: 'Dudhsagar Falls',
+              country: 'India',
+              countryCode: 'IN',
+              city: 'MockTestCity',
+              category: 'Lakes and Waterfalls',
+              latitude: 15.3144,
+              longitude: 74.3143,
+              source: 'osm',
+              externalId: 'node/99001',
+              sourceIds: { osmType: 'node', osmId: '99001', osmCompositeId: 'node/99001' },
+              sourceMetadata: { locality: 'Sonaulim', address: 'Bhagwan Mahaveer Sanctuary' },
+            },
+          ],
+          endpointUsed: 'https://overpass.kumi.systems/api/interpreter',
+          attempts: [
+            {
+              endpoint: 'https://overpass.kumi.systems/api/interpreter',
+              status: 200,
+              message: 'Returned 1 verified OSM attraction',
+            },
+          ],
+          allRateLimited: false,
+        };
+      },
+    },
+  });
+  assert.equal(liveOsmCalls, 1);
+  assert.equal(liveSuccessRes.searchRadiusMeters, 35000);
+  assert.equal(liveSuccessRes.attractions[0].name, 'Dudhsagar Falls');
+  assert.equal(liveSuccessRes.attractions[0].locality, 'Sonaulim');
+  assert.ok(getDiscoveryCacheStats().entries >= 1);
+
+  // 3) Repeat query serves cached result immediately without calling OSM again
+  const cachedRes = await discoverAttractionsForDestination({
+    destination: 'MockTestCity, India',
+    providersOverride: emptyFailureProviders,
+  });
+  assert.equal(cachedRes.source, 'server-cache');
+  assert.equal(cachedRes.attractions[0].name, 'Dudhsagar Falls');
+
+  // 4) Force refresh when all live servers fail falls back cleanly to stale cached real attractions
+  await PlaceModel.deleteMany({ city: 'MockTestCity' });
+  const staleFallbackRes = await discoverAttractionsForDestination({
+    destination: 'MockTestCity, India',
+    forceRefresh: true,
+    providersOverride: emptyFailureProviders,
+  });
+  assert.equal(staleFallbackRes.source, 'server-cache');
+  assert.equal(staleFallbackRes.attractions[0].name, 'Dudhsagar Falls');
+  assert.ok(staleFallbackRes.coverageNotice?.includes('Retry Discovery'));
+});
+
 

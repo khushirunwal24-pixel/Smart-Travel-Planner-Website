@@ -132,7 +132,7 @@ export async function connectToMongoDB(): Promise<typeof mongoose | null> {
         const conn = await mongoose.connect(uri, {
           dbName,
           maxPoolSize: isServerlessOrProd ? 5 : 10,
-          serverSelectionTimeoutMS: 5000,
+          serverSelectionTimeoutMS: isServerlessOrProd ? 2500 : 5000,
           socketTimeoutMS: 30000,
         });
 

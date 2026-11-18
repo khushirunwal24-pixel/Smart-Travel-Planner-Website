@@ -36,6 +36,8 @@ export interface DiscoveredAttraction {
   subcategory?: string;
   tags?: string[];
   city?: string;
+  locality?: string;
+  address?: string;
   country?: string;
   countryCode?: string;
   lat: number;
@@ -63,7 +65,7 @@ export interface DiscoveredAttraction {
   recommendationScore?: number;
   recommendationExplanation?: string;
   osmUrl: string;
-  dataSource?: 'openstreetmap-overpass' | 'wikidata-wikipedia' | 'overture' | 'traveltype' | 'mongodb-cache' | 'multi-source';
+  dataSource?: 'openstreetmap-overpass' | 'wikidata-wikipedia' | 'overture' | 'traveltype' | 'mongodb-cache' | 'server-cache' | 'multi-source';
   sources?: string[];
   sourceLicences?: SourceLicenceInfo[];
 }
@@ -72,6 +74,7 @@ export interface EndpointAttemptLog {
   endpoint: string;
   status: number | 'timeout' | 'network-error';
   message: string;
+  retryAfterSeconds?: number;
 }
 
 export interface DiscoveryResponse {
@@ -80,7 +83,7 @@ export interface DiscoveryResponse {
   startDistanceKm: number | null;
   searchRadiusMeters: number;
   endpointUsed: string;
-  source: 'openstreetmap-overpass' | 'wikidata-wikipedia' | 'mixed' | 'mongodb-cache' | 'multi-source';
+  source: 'openstreetmap-overpass' | 'wikidata-wikipedia' | 'mixed' | 'mongodb-cache' | 'server-cache' | 'multi-source';
   attempts: EndpointAttemptLog[];
   note?: string;
   coverageNotice?: string;
@@ -157,6 +160,7 @@ export interface GeoCoordinates {
   displayName: string;
   country?: string;
   admin1?: string;
+  placeType?: string;
   lat: number;
   lng: number;
 }
