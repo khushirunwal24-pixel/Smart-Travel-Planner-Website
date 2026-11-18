@@ -1,0 +1,94 @@
+{
+  "schema_version": "v1",
+  "model_type": "lightgbm-lambdarank-onnx",
+  "objective": "lambdarank",
+  "input_name": "features",
+  "output_name": "score",
+  "num_features": 12,
+  "features": [
+    {
+      "index": 0,
+      "name": "interest_match",
+      "range": [0.0, 1.0],
+      "description": "Token and category overlap between user travel preferences and attraction category/tags/description."
+    },
+    {
+      "index": 1,
+      "name": "category_id_norm",
+      "range": [0.0, 1.0],
+      "description": "Deterministic attraction category index divided by 9."
+    },
+    {
+      "index": 2,
+      "name": "budget_compatibility",
+      "range": [0.0, 1.0],
+      "description": "Compatibility of explicit entrance fee with daily per-person budget (0.7 neutral when price is unavailable)."
+    },
+    {
+      "index": 3,
+      "name": "distance_from_center_km_norm",
+      "range": [0.0, 1.0],
+      "description": "Distance from city center clamped to 50 km and divided by 50."
+    },
+    {
+      "index": 4,
+      "name": "distance_from_prev_km_norm",
+      "range": [0.0, 1.0],
+      "description": "Distance from previous itinerary stop clamped to 50 km and divided by 50 (falls back to center distance)."
+    },
+    {
+      "index": 5,
+      "name": "popularity_log_norm",
+      "range": [0.0, 1.0],
+      "description": "min(1, log10(1 + popularity) / 4) when sourced popularity exists, otherwise 0."
+    },
+    {
+      "index": 6,
+      "name": "has_verified_rating",
+      "range": [0.0, 1.0],
+      "description": "1.0 if a verified rating exists from an external source, otherwise 0.0."
+    },
+    {
+      "index": 7,
+      "name": "verified_rating_norm",
+      "range": [0.0, 1.0],
+      "description": "Verified rating / 5.0 when available, otherwise 0.0."
+    },
+    {
+      "index": 8,
+      "name": "estimated_duration_norm",
+      "range": [0.0, 1.0],
+      "description": "Visit duration (sourced or labelled estimate) clamped to 240 min and divided by 240."
+    },
+    {
+      "index": 9,
+      "name": "user_category_feedback_score",
+      "range": [-1.0, 1.0],
+      "description": "Smoothed historical feedback affinity for the user on the same category: (positive - negative) / (total + 3)."
+    },
+    {
+      "index": 10,
+      "name": "trip_days_norm",
+      "range": [0.0, 1.0],
+      "description": "Available trip days clamped to 14 and divided by 14."
+    },
+    {
+      "index": 11,
+      "name": "source_richness_norm",
+      "range": [0.0, 1.0],
+      "description": "Provenance diversity + description availability + source confidence."
+    }
+  ],
+  "label_mapping": {
+    "visited": 3,
+    "saved": 2,
+    "selected": 2,
+    "liked": 2,
+    "skipped": 0,
+    "disliked": 0
+  },
+  "minimum_training_thresholds": {
+    "min_feedback_samples": 50,
+    "min_query_groups": 10
+  }
+}

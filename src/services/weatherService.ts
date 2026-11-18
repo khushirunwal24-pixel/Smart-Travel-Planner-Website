@@ -1,5 +1,8 @@
 import { WeatherData, DailyForecast } from '../types';
 
+const weatherCache = new Map<string, { data: WeatherData; expiresAt: number }>();
+const WEATHER_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+
 // Map WMO weather codes to human descriptions and icon styles
 export function getWeatherDescription(code: number): { label: string; icon: string } {
   if (code === 0) return { label: 'Clear Sky', icon: 'Sun' };
@@ -14,7 +17,7 @@ export function getWeatherDescription(code: number): { label: string; icon: stri
   return { label: 'Mild / Pleasant', icon: 'Sun' };
 }
 
-// Fallback curated weather for popular travel hubs
+// Fallback curated weather when offline/unavailable
 const FALLBACK_CITIES: Record<string, Partial<WeatherData>> = {
   paris: { temp: 19, feelsLike: 18, condition: 'Partly Cloudy', weatherCode: 2, humidity: 62, windSpeed: 14, uvIndex: 4 },
   tokyo: { temp: 22, feelsLike: 23, condition: 'Clear Sky', weatherCode: 0, humidity: 55, windSpeed: 11, uvIndex: 6 },
@@ -23,27 +26,67 @@ const FALLBACK_CITIES: Record<string, Partial<WeatherData>> = {
   london: { temp: 16, feelsLike: 15, condition: 'Light Drizzle', weatherCode: 51, humidity: 74, windSpeed: 18, uvIndex: 3 },
   'new york': { temp: 21, feelsLike: 20, condition: 'Breezy & Clear', weatherCode: 1, humidity: 50, windSpeed: 15, uvIndex: 5 },
   jaipur: { temp: 31, feelsLike: 32, condition: 'Sunny & Warm', weatherCode: 0, humidity: 35, windSpeed: 8, uvIndex: 8 },
+  udaipur: { temp: 29, feelsLike: 30, condition: 'Clear Sky', weatherCode: 0, humidity: 38, windSpeed: 9, uvIndex: 7 },
+  delhi: { temp: 28, feelsLike: 29, condition: 'Clear & Breezy', weatherCode: 1, humidity: 45, windSpeed: 10, uvIndex: 7 },
   dubai: { temp: 33, feelsLike: 36, condition: 'Sunny & Hot', weatherCode: 0, humidity: 40, windSpeed: 12, uvIndex: 10 },
   zurich: { temp: 15, feelsLike: 14, condition: 'Alpine Fresh', weatherCode: 2, humidity: 65, windSpeed: 10, uvIndex: 4 },
 };
 
-export async function fetchLiveWeather(destination: string): Promise<WeatherData> {
-  const cleanCity = destination.split(',')[0].trim();
+export interface WeatherServiceOptions {
+  geocodeUrl?: string;
+  forecastUrl?: string;
+}
+
+export async function fetchLiveWeather(
+  destination: string,
+  options?: WeatherServiceOptions
+): Promise<WeatherData> {
+  const parts = destination.split(',').map((p) => p.trim()).filter(Boolean);
+  const cleanCity = parts[0] || destination.trim();
+  const regionHint = parts.slice(1).join(' ').toLowerCase();
   const lowerKey = cleanCity.toLowerCase();
 
+  const geocodeEndpoint =
+    options?.geocodeUrl || 'https://geocoding-api.open-meteo.com/v1/search';
+  const forecastEndpoint =
+    options?.forecastUrl || 'https://api.open-meteo.com/v1/forecast';
+
+  const cacheKey = `${geocodeEndpoint}|${destination.trim().toLowerCase()}`;
+  const cached = weatherCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.data;
+  }
+
   try {
-    // 1. Geocode city name via Open-Meteo free geocoding API
-    const geoUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(
+    // 1. Geocode city name via Open-Meteo geocoding API (pick best by region hint + population)
+    const geoUrl = `${geocodeEndpoint}?name=${encodeURIComponent(
       cleanCity
-    )}&count=1&language=en&format=json`;
+    )}&count=6&language=en&format=json`;
     const geoRes = await fetch(geoUrl);
     const geoData = await geoRes.json();
 
     if (geoData.results && geoData.results.length > 0) {
-      const { latitude, longitude, country, name } = geoData.results[0];
+      const ranked = [...geoData.results].sort((a: any, b: any) => {
+        const score = (item: any) => {
+          let s = 0;
+          if ((item.name || '').toLowerCase() === lowerKey) s += 100;
+          if (
+            regionHint &&
+            ((item.country || '').toLowerCase().includes(regionHint) ||
+              (item.admin1 || '').toLowerCase().includes(regionHint))
+          ) {
+            s += 200;
+          }
+          if (item.population) s += Math.min(80, Math.log10(Math.max(10, item.population)) * 12);
+          return s;
+        };
+        return score(b) - score(a);
+      });
+
+      const { latitude, longitude, country, name } = ranked[0];
 
       // 2. Query forecast data from Open-Meteo
-      const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current_weather=true&hourly=relativehumidity_2m,apparent_temperature&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto`;
+      const weatherUrl = `${forecastEndpoint}?latitude=${latitude}&longitude=${longitude}&current_weather=true&hourly=relativehumidity_2m,apparent_temperature&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto`;
       const weatherRes = await fetch(weatherUrl);
       const data = await weatherRes.json();
 
@@ -58,8 +101,9 @@ export async function fetchLiveWeather(destination: string): Promise<WeatherData
           const daysCount = Math.min(5, data.daily.time.length);
           for (let i = 0; i < daysCount; i++) {
             const dateStr = data.daily.time[i];
-            const d = new Date(dateStr);
-            const dayName = i === 0 ? 'Today' : d.toLocaleDateString('en-US', { weekday: 'short' });
+            const d = new Date(`${dateStr}T12:00:00Z`);
+            const dayName =
+              i === 0 ? 'Today' : d.toLocaleDateString('en-US', { weekday: 'short', timeZone: 'UTC' });
             const dayCode = data.daily.weathercode?.[i] ?? code;
             forecast.push({
               date: dateStr,
@@ -78,9 +122,11 @@ export async function fetchLiveWeather(destination: string): Promise<WeatherData
         const humidity = data.hourly?.relativehumidity_2m?.[hourIdx] ?? 55;
         const feelsLike = Math.round(data.hourly?.apparent_temperature?.[hourIdx] ?? cw.temperature);
 
-        return {
+        const result: WeatherData = {
           city: name || cleanCity,
           country: country || '',
+          lat: latitude,
+          lng: longitude,
           temp: Math.round(cw.temperature),
           feelsLike,
           condition: desc.label,
@@ -91,10 +137,13 @@ export async function fetchLiveWeather(destination: string): Promise<WeatherData
           forecast,
           source: 'live',
         };
+
+        weatherCache.set(cacheKey, { data: result, expiresAt: Date.now() + WEATHER_CACHE_TTL_MS });
+        return result;
       }
     }
   } catch (err) {
-    console.warn('Live weather lookup failed, serving curated fallback:', err);
+    console.warn('Live weather lookup failed, serving fallback:', err);
   }
 
   // Fallback state

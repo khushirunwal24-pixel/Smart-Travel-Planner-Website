@@ -3,10 +3,15 @@ import { Compass, Heart, Github, Send, Check, Award, Shield, MapPin, Zap } from 
 
 interface FooterProps {
   onOpenSynopsis: () => void;
+  onOpenAttribution?: () => void;
   setActiveTab: (tab: string) => void;
 }
 
-export const Footer: React.FC<FooterProps> = ({ onOpenSynopsis, setActiveTab }) => {
+export const Footer: React.FC<FooterProps> = ({
+  onOpenSynopsis,
+  onOpenAttribution,
+  setActiveTab,
+}) => {
   const [email, setEmail] = useState('');
   const [subscribed, setSubscribed] = useState(false);
 
@@ -180,6 +185,14 @@ export const Footer: React.FC<FooterProps> = ({ onOpenSynopsis, setActiveTab }) 
             <span className="flex items-center gap-1.5 text-slate-400">
               <Shield className="w-3.5 h-3.5 text-emerald-400" /> Secure Firebase Cloud
             </span>
+            {onOpenAttribution && (
+              <button
+                onClick={onOpenAttribution}
+                className="text-slate-400 hover:text-white transition-colors cursor-pointer"
+              >
+                Data Licensing & Attribution
+              </button>
+            )}
             <button
               onClick={onOpenSynopsis}
               className="text-slate-400 hover:text-white transition-colors cursor-pointer"

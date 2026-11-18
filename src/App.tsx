@@ -10,6 +10,7 @@ import { RouteMap } from './components/RouteMap';
 import { WeatherWidget } from './components/WeatherWidget';
 import { AuthModal } from './components/AuthModal';
 import { ProjectSynopsisModal } from './components/ProjectSynopsisModal';
+import { AttributionModal } from './components/AttributionModal';
 import { ToastContainer } from './components/Toast';
 import { Trip, Itinerary, ToastMessage } from './types';
 import { getTrips, getItinerary } from './services/tripService';
@@ -24,6 +25,9 @@ function AppContent() {
   // Active trip & itinerary for Map and Budget
   const [activeTrip, setActiveTrip] = useState<Trip | null>(null);
   const [activeItinerary, setActiveItinerary] = useState<Itinerary | null>(null);
+  const [focusedMapSpot, setFocusedMapSpot] = useState<import('./types').TripLocationItem | null>(
+    null
+  );
 
   // Planner prefill from search or popular cards
   const [plannerPrefill, setPlannerPrefill] = useState<{
@@ -33,8 +37,8 @@ function AppContent() {
     endDate?: string;
     travelers?: number;
   }>({
-    destination: 'Tokyo, Japan',
-    startLocation: 'London, UK',
+    destination: 'Udaipur',
+    startLocation: 'Bilaspur',
     travelers: 2,
   });
 
@@ -42,6 +46,7 @@ function AppContent() {
   const [authModalOpen, setAuthModalOpen] = useState(false);
   const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
   const [synopsisModalOpen, setSynopsisModalOpen] = useState(false);
+  const [attributionModalOpen, setAttributionModalOpen] = useState(false);
 
   // Toast notifications state
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
@@ -78,10 +83,13 @@ function AppContent() {
   // When active trip changes, load its itinerary
   useEffect(() => {
     if (!activeTrip) return;
+    if (activeItinerary && activeItinerary.tripId === activeTrip.id && activeTrip.id === 'temp_trip') {
+      return;
+    }
     async function loadIt() {
       try {
         const it = await getItinerary(activeTrip!.id, userId, isGuest);
-        setActiveItinerary(it);
+        if (it) setActiveItinerary(it);
       } catch (err) {
         console.warn('Itinerary load handled:', err);
       }
@@ -106,12 +114,17 @@ function AppContent() {
   const handleTripCreated = (newTrip: Trip, newItinerary: Itinerary) => {
     setActiveTrip(newTrip);
     setActiveItinerary(newItinerary);
-    showToast('success', 'Trip Plan Created', `${newTrip.title} has been initialized.`);
+    showToast('success', 'Trip Plan Created', `${newTrip.title} has been saved.`);
   };
 
-  const handleViewOnMap = (trip: Trip, itinerary: Itinerary) => {
+  const handleViewOnMap = (
+    trip: Trip,
+    itinerary: Itinerary,
+    spot?: import('./types').TripLocationItem
+  ) => {
     setActiveTrip(trip);
     setActiveItinerary(itinerary);
+    setFocusedMapSpot(spot || null);
     setActiveTab('map');
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
@@ -120,6 +133,7 @@ function AppContent() {
     if (trip) {
       setActiveTrip(trip);
     }
+    setFocusedMapSpot(null);
     setActiveTab(tab);
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
@@ -168,6 +182,7 @@ function AppContent() {
         {activeTab === 'budget' && (
           <BudgetManager
             currentTrip={activeTrip}
+            currentItinerary={activeItinerary}
             onSelectTrip={(t) => setActiveTrip(t)}
             onShowToast={showToast}
           />
@@ -177,13 +192,14 @@ function AppContent() {
           <RouteMap
             trip={activeTrip}
             itinerary={activeItinerary}
+            focusedSpot={focusedMapSpot}
             onSelectTrip={() => setActiveTab('dashboard')}
           />
         )}
 
         {activeTab === 'weather' && (
           <WeatherWidget
-            initialDestination={activeTrip?.destination || 'Tokyo, Japan'}
+            initialDestination={activeTrip?.destination || 'Udaipur'}
           />
         )}
       </main>
@@ -191,6 +207,7 @@ function AppContent() {
       {/* Footer */}
       <Footer
         onOpenSynopsis={() => setSynopsisModalOpen(true)}
+        onOpenAttribution={() => setAttributionModalOpen(true)}
         setActiveTab={setActiveTab}
       />
 
@@ -208,6 +225,11 @@ function AppContent() {
       <ProjectSynopsisModal
         isOpen={synopsisModalOpen}
         onClose={() => setSynopsisModalOpen(false)}
+      />
+
+      <AttributionModal
+        isOpen={attributionModalOpen}
+        onClose={() => setAttributionModalOpen(false)}
       />
 
       <ToastContainer toasts={toasts} onDismiss={dismissToast} />

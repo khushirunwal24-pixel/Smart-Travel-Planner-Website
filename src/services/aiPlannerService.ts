@@ -1,4 +1,8 @@
-import { DayItinerary } from '../types';
+import {
+  DiscoveredAttraction,
+  GeoCoordinates,
+  ItineraryGenerationResponse,
+} from '../types';
 
 export interface PlanTripParams {
   destination: string;
@@ -10,129 +14,512 @@ export interface PlanTripParams {
   travelPreferences: string;
   travelMode: string;
   accommodation: string;
+  radiusMeters?: number;
+  customOverpassUrl?: string;
+  customOsrmUrl?: string;
+  waitOnRateLimit?: boolean;
 }
 
-export async function generateSmartItinerary(params: PlanTripParams): Promise<{
-  days: DayItinerary[];
-  source: string;
-  note?: string;
-}> {
+export interface EndpointAttemptInfo {
+  endpoint: string;
+  status: number | 'timeout' | 'network-error';
+  message: string;
+}
+
+export interface AttractionDiscoveryResult {
+  destinationInfo: GeoCoordinates;
+  attractions: DiscoveredAttraction[];
+  searchRadiusMeters: number;
+  overpassEndpointUsed: string;
+  fallbacksTried: string[];
+  source?: string;
+  attempts?: EndpointAttemptInfo[];
+  coverageNotice?: string;
+  modelStatus?: {
+    mode: 'baseline' | 'onnx';
+    modelVersion: string;
+    trainedModelReady: boolean;
+    reason?: string;
+  };
+  queryGroupId?: string;
+}
+
+export type PlannerErrorCode =
+  | 'RATE_LIMITED'
+  | 'SERVICE_UNAVAILABLE'
+  | 'INSUFFICIENT_RESULTS'
+  | 'GEOCODE_ERROR'
+  | 'VALIDATION_ERROR'
+  | 'INTERNAL_ERROR';
+
+export class PlannerApiError extends Error {
+  code: PlannerErrorCode;
+  statusCode?: number;
+  retryAfterSeconds?: number;
+  destGeo?: GeoCoordinates;
+  attempts?: EndpointAttemptInfo[];
+
+  constructor(
+    message: string,
+    code: PlannerErrorCode,
+    options?: {
+      statusCode?: number;
+      retryAfterSeconds?: number;
+      destGeo?: GeoCoordinates;
+      attempts?: EndpointAttemptInfo[];
+    }
+  ) {
+    super(message);
+    this.name = 'PlannerApiError';
+    this.code = code;
+    this.statusCode = options?.statusCode;
+    this.retryAfterSeconds = options?.retryAfterSeconds;
+    this.destGeo = options?.destGeo;
+    this.attempts = options?.attempts;
+  }
+}
+
+export interface ApiEndpointsConfig {
+  overpassUrl: string;
+  overpassFallbacks?: string[];
+  osrmUrl: string;
+  openMeteoGeocodeUrl: string;
+  openMeteoForecastUrl: string;
+}
+
+export async function fetchDefaultApiConfig(): Promise<ApiEndpointsConfig> {
   try {
-    const res = await fetch('/api/generate-itinerary', {
+    const res = await fetch('/api/config', {
+      headers: { Accept: 'application/json' },
+    });
+    if (res.ok) {
+      return await parseBackendResponse<ApiEndpointsConfig>(res, 'API config');
+    }
+  } catch {
+    // Fallback to public defaults if config endpoint temporarily unreachable
+  }
+  return {
+    overpassUrl: 'https://overpass-api.de/api/interpreter',
+    overpassFallbacks: [
+      'https://overpass-api.de/api/interpreter',
+      'https://overpass.kumi.systems/api/interpreter',
+    ],
+    osrmUrl: 'https://router.project-osrm.org/route/v1/driving',
+    openMeteoGeocodeUrl: 'https://geocoding-api.open-meteo.com/v1/search',
+    openMeteoForecastUrl: 'https://api.open-meteo.com/v1/forecast',
+  };
+}
+
+function buildSafeResponsePreview(rawText: string, maxLen = 200): string {
+  if (!rawText) return '';
+  return rawText
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/(api[_-]?key|token|password|secret)=([^&\s]+)/gi, '$1=[REDACTED]')
+    .trim()
+    .slice(0, maxLen);
+}
+
+export async function parseBackendResponse<T>(res: Response, contextLabel: string): Promise<T> {
+  const contentType = res.headers.get('content-type') || 'unknown';
+  const rawText = await res.text();
+  const trimmed = rawText.trim();
+  const bodyPreview = buildSafeResponsePreview(rawText);
+
+  let payload: any = null;
+  let parseErrorMsg: string | null = null;
+  if (trimmed) {
+    try {
+      payload = JSON.parse(trimmed);
+    } catch (err: any) {
+      payload = null;
+      parseErrorMsg = err?.message || 'JSON syntax error';
+    }
+  }
+
+  const ctLower = contentType.toLowerCase();
+  const looksHtml =
+    ctLower.includes('text/html') || /^<!doctype\s+html|^<html\b/i.test(trimmed);
+  const looksXml =
+    !looksHtml && (ctLower.includes('xml') || /^<\?xml\b|^<osm\b/i.test(trimmed));
+
+  if (!payload || typeof payload !== 'object') {
+    console.error(`[${contextLabel}] Unexpected non-JSON response`, {
+      url: res.url || 'unknown',
+      status: res.status,
+      contentType,
+      parseError: parseErrorMsg || (trimmed ? 'non-object JSON value' : 'empty body'),
+      bodyPreview: bodyPreview || '(empty)',
+    });
+  }
+
+  if (!res.ok) {
+    const code: PlannerErrorCode =
+      (payload?.code as PlannerErrorCode) ||
+      (res.status === 429
+        ? 'RATE_LIMITED'
+        : res.status === 404
+        ? 'INSUFFICIENT_RESULTS'
+        : res.status === 400
+        ? 'VALIDATION_ERROR'
+        : 'SERVICE_UNAVAILABLE');
+
+    const backendMsg =
+      payload?.error ||
+      (looksHtml
+        ? `${contextLabel} failed with HTTP ${res.status} (HTML response, Content-Type: ${contentType}).`
+        : bodyPreview
+        ? `${contextLabel} failed (HTTP ${res.status}, Content-Type: ${contentType}): ${bodyPreview}`
+        : `${contextLabel} failed with backend HTTP ${res.status}.`);
+
+    throw new PlannerApiError(backendMsg, code, {
+      statusCode: res.status,
+      retryAfterSeconds: payload?.retryAfterSeconds,
+      destGeo: payload?.destGeo,
+      attempts: payload?.attempts,
+    });
+  }
+
+  if (!payload || typeof payload !== 'object') {
+    const detail = looksHtml
+      ? `received an HTML page instead of JSON (HTTP ${res.status}, Content-Type: ${contentType})`
+      : looksXml
+      ? `received XML instead of JSON (HTTP ${res.status}, Content-Type: ${contentType})`
+      : !trimmed
+      ? `received an empty response body (HTTP ${res.status}, Content-Type: ${contentType})`
+      : `returned an unexpected non-JSON response (HTTP ${res.status}, Content-Type: ${contentType})`;
+
+    const previewNote = !looksHtml && bodyPreview ? ` Preview: ${bodyPreview.slice(0, 120)}` : '';
+    throw new PlannerApiError(
+      `${contextLabel} ${detail}.${previewNote}`,
+      'SERVICE_UNAVAILABLE',
+      { statusCode: res.status }
+    );
+  }
+
+  return payload as T;
+}
+
+const INVALID_LITERAL_DESTINATIONS = new Set(['null', 'undefined', 'nan', 'none', 'n/a', 'na']);
+
+export function validateDestinationInput(raw: string): {
+  valid: boolean;
+  cleaned?: string;
+  error?: string;
+} {
+  const trimmed = (raw || '').trim();
+  if (!trimmed) {
+    return {
+      valid: false,
+      error: 'Destination cannot be empty. Please enter a city name such as Jaipur, Udaipur, or Delhi.',
+    };
+  }
+
+  if (trimmed.length > 120) {
+    return {
+      valid: false,
+      error: 'Destination name is too long. Please enter a concise city or region name.',
+    };
+  }
+
+  const parts = trimmed
+    .split(',')
+    .map((p) => p.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '').trim())
+    .filter(Boolean);
+
+  if (parts.length === 0) {
+    return {
+      valid: false,
+      error: 'Destination cannot be empty. Please enter a valid city name such as Jaipur, Udaipur, or Delhi.',
+    };
+  }
+
+  const cityQuery = parts[0];
+  if (
+    INVALID_LITERAL_DESTINATIONS.has(cityQuery.toLowerCase()) ||
+    INVALID_LITERAL_DESTINATIONS.has(trimmed.toLowerCase())
+  ) {
+    return {
+      valid: false,
+      error: 'Please enter a real destination city name (e.g. Jaipur, Udaipur, or Delhi).',
+    };
+  }
+
+  const lettersOnly = cityQuery.replace(/[^\p{L}]/gu, '');
+  if (lettersOnly.length < 2) {
+    return {
+      valid: false,
+      error: 'Please enter a valid destination name with at least 2 letters (e.g. Jaipur, Udaipur, or Delhi).',
+    };
+  }
+
+  return {
+    valid: true,
+    cleaned: parts.join(', '),
+  };
+}
+
+// Step 1: Discover real tourist attractions via backend (MongoDB-first + multi-source backfill + single ranker)
+export async function discoverRealAttractions(params: {
+  destination: string;
+  travelPreferences?: string;
+  radiusMeters?: number;
+  customOverpassUrl?: string;
+  budget?: number;
+  travelers?: number;
+  tripDays?: number;
+  userId?: string;
+  forceRefresh?: boolean;
+}): Promise<AttractionDiscoveryResult> {
+  const validation = validateDestinationInput(params.destination);
+  if (!validation.valid || !validation.cleaned) {
+    throw new PlannerApiError(
+      validation.error || 'Destination cannot be empty.',
+      'VALIDATION_ERROR',
+      { statusCode: 400 }
+    );
+  }
+
+  let res: Response;
+  try {
+    res = await fetch('/api/discover-attractions', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({ ...params, destination: validation.cleaned }),
+    });
+  } catch (err: any) {
+    throw new PlannerApiError(
+      `Unable to reach attraction discovery backend: ${err?.message || 'Network error'}.`,
+      'SERVICE_UNAVAILABLE'
+    );
+  }
+
+  const data = await parseBackendResponse<AttractionDiscoveryResult>(res, 'Attraction discovery');
+  if (!Array.isArray(data.attractions) || data.attractions.length === 0) {
+    throw new PlannerApiError(
+      'Backend returned 0 tourist attractions for this destination.',
+      'INSUFFICIENT_RESULTS',
+      { statusCode: res.status, destGeo: data.destinationInfo, attempts: data.attempts }
+    );
+  }
+  return data;
+}
+
+// Step 2: Generate day-wise itinerary using ONLY the user's selected attractions
+export async function generateItineraryFromSelected(
+  params: PlanTripParams & {
+    selectedAttractions: DiscoveredAttraction[];
+    allDiscovered?: DiscoveredAttraction[];
+    destinationInfo: GeoCoordinates;
+    overpassEndpointUsed?: string;
+  }
+): Promise<ItineraryGenerationResponse> {
+  let res: Response;
+  try {
+    res = await fetch('/api/generate-selected-itinerary', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
       body: JSON.stringify(params),
     });
-
-    if (res.ok) {
-      const data = await res.json();
-      if (data.itinerary && Array.isArray(data.itinerary)) {
-        return {
-          days: data.itinerary,
-          source: data.source || 'ai-planner',
-          note: data.note,
-        };
-      }
-    }
-  } catch (err) {
-    console.warn('Backend itinerary API call failed, generating in-browser:', err);
+  } catch (err: any) {
+    throw new PlannerApiError(
+      `Unable to reach itinerary builder backend: ${err?.message || 'Network error'}.`,
+      'SERVICE_UNAVAILABLE'
+    );
   }
 
-  // Client-side instant generator
-  const days = generateClientItinerary(params);
-  return {
-    days,
-    source: 'smart-client-engine',
-    note: 'Generated with intelligent destination blueprint engine',
+  const data = await parseBackendResponse<ItineraryGenerationResponse>(
+    res,
+    'Itinerary generation'
+  );
+  if (!Array.isArray(data.itinerary)) {
+    throw new PlannerApiError(
+      'Backend returned an invalid itinerary payload.',
+      'INTERNAL_ERROR',
+      { statusCode: res.status }
+    );
+  }
+  return data;
+}
+
+// Single-step helper (kept for compatibility, server-side only)
+export async function generateRealItinerary(
+  params: PlanTripParams
+): Promise<ItineraryGenerationResponse> {
+  const validation = validateDestinationInput(params.destination);
+  if (!validation.valid || !validation.cleaned) {
+    throw new PlannerApiError(
+      validation.error || 'Destination cannot be empty.',
+      'VALIDATION_ERROR',
+      { statusCode: 400 }
+    );
+  }
+
+  let res: Response;
+  try {
+    res = await fetch('/api/generate-itinerary', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({ ...params, destination: validation.cleaned }),
+    });
+  } catch (err: any) {
+    throw new PlannerApiError(
+      `Unable to reach trip planning backend: ${err?.message || 'Network error'}.`,
+      'SERVICE_UNAVAILABLE'
+    );
+  }
+
+  const data = await parseBackendResponse<ItineraryGenerationResponse>(
+    res,
+    'Itinerary generation'
+  );
+  if (!Array.isArray(data.itinerary)) {
+    throw new PlannerApiError(
+      'Backend returned an invalid itinerary payload.',
+      'INTERNAL_ERROR',
+      { statusCode: res.status }
+    );
+  }
+  return data;
+}
+
+export type FeedbackAction = 'selected' | 'saved' | 'liked' | 'disliked' | 'skipped' | 'visited';
+
+export interface ModelStatusSummary {
+  mode: 'baseline' | 'onnx';
+  modelVersion: string;
+  modelType: 'baseline-heuristic' | 'lightgbm-lambdarank-onnx';
+  trainedModelReady: boolean;
+  feedbackCount: number;
+  distinctQueryGroups: number;
+  minRequiredSamples: number;
+  minRequiredGroups: number;
+  reason: string;
+  metrics: {
+    ndcgAt5?: number | null;
+    ndcgAt10?: number | null;
+    precisionAt5?: number | null;
+  } | null;
+}
+
+export interface AttributionResponse {
+  sources: Array<{
+    source: string;
+    licence: string;
+    attribution: string;
+    url?: string;
+  }>;
+  imagePolicy: string;
+  datasetStats?: {
+    placesCount: number;
+    citiesCount: number;
+    mongodb?: { connected: boolean };
   };
 }
 
-function generateClientItinerary(params: PlanTripParams): DayItinerary[] {
-  const start = new Date(params.startDate || Date.now());
-  const end = new Date(params.endDate || Date.now() + 3 * 86400000);
-  const diffTime = Math.abs(end.getTime() - start.getTime());
-  const totalDays = Math.max(1, Math.min(10, Math.ceil(diffTime / (1000 * 60 * 60 * 24)))) || 3;
-
-  const dest = params.destination.trim();
-  const dailyBudget = Math.round((params.budget || 75000) / totalDays);
-
-  const cityCoords: Record<string, { lat: number; lng: number }> = {
-    paris: { lat: 48.8566, lng: 2.3522 },
-    tokyo: { lat: 35.6762, lng: 139.6503 },
-    bali: { lat: -8.4095, lng: 115.1889 },
-    rome: { lat: 41.9028, lng: 12.4964 },
-    london: { lat: 51.5074, lng: -0.1278 },
-    'new york': { lat: 40.7128, lng: -74.006 },
-    jaipur: { lat: 26.9124, lng: 75.7873 },
-    dubai: { lat: 25.2048, lng: 55.2708 },
-    singapore: { lat: 1.3521, lng: 103.8198 },
-    bangkok: { lat: 13.7563, lng: 100.5018 },
-    barcelona: { lat: 41.3879, lng: 2.1699 },
-    zurich: { lat: 47.3769, lng: 8.5417 },
+export async function submitAttractionFeedback(payload: {
+  userId?: string;
+  queryGroupId?: string;
+  attraction: DiscoveredAttraction;
+  destination: string;
+  center?: GeoCoordinates;
+  action: FeedbackAction;
+  context?: {
+    preferences?: string[];
+    budget?: number;
+    travelers?: number;
+    tripDays?: number;
+    rankingMode?: 'baseline' | 'onnx';
+    rankPosition?: number;
   };
-
-  const key = dest.toLowerCase();
-  const baseCoord = cityCoords[key] || { lat: 48.8566, lng: 2.3522 };
-
-  const itineraries: DayItinerary[] = [];
-
-  const dayThemes = [
-    'Arrival, Historic Heart & Iconic Skyline Views',
-    'Cultural Heritage, Hidden Passages & Local Food Tasting',
-    'Scenic Nature Waterfronts & Sunset Dining',
-    'Artistic Districts, Architecture & Boutique Shopping',
-    'Scenic Viewpoint Discovery & Evening Gastronomy',
-    'Historic Palaces, Gardens & Traditional Craft Markets',
-    'Farewell Strolls, Panoramic Rooftops & Souvenir Bazaars',
-  ];
-
-  for (let d = 1; d <= totalDays; d++) {
-    const theme = dayThemes[(d - 1) % dayThemes.length];
-    const latDelta1 = (d * 0.007) - 0.012;
-    const lngDelta1 = ((d * 0.01) % 0.02) - 0.008;
-
-    itineraries.push({
-      dayNumber: d,
-      theme: `Day ${d}: ${theme}`,
-      description: `Explore top-rated landmarks in ${dest} tailored for ${params.travelers} traveler(s) with focus on ${params.travelPreferences || 'Discovery'}.`,
-      estimatedCost: dailyBudget,
-      locations: [
-        {
-          name: `${dest} Morning Highlight – Grand Plaza`,
-          description: `Kick off day ${d} with an architectural walk, morning coffee culture, and panoramic photographs.`,
-          visitingTime: '09:00 AM – 11:30 AM',
-          cost: Math.round(dailyBudget * 0.25),
-          recommendedActivity: 'Guided architectural tour & scenic photo spots',
-          foodSuggestion: 'Local artisan breakfast, freshly brewed coffee and morning pastries',
-          estimatedDistance: '1.2 km from base accommodation',
-          lat: +(baseCoord.lat + latDelta1).toFixed(4),
-          lng: +(baseCoord.lng + lngDelta1).toFixed(4),
+}): Promise<{ saved: boolean; relevanceLabel?: number }> {
+  try {
+    const res = await fetch('/api/feedback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: payload.userId || 'guest_traveler_101',
+        queryGroupId: payload.queryGroupId,
+        placeId: payload.attraction.placeId || payload.attraction.id,
+        placeName: payload.attraction.name,
+        category: payload.attraction.category,
+        destination: payload.destination,
+        city: payload.attraction.city || payload.center?.name,
+        countryCode: payload.attraction.countryCode,
+        action: payload.action,
+        attraction: payload.attraction,
+        center: payload.center,
+        context: {
+          ...payload.context,
+          distanceFromCenterKm: payload.attraction.distanceFromCenterKm,
         },
-        {
-          name: `${dest} Cultural Quarter & Heritage Spot`,
-          description: `Discover centuries of local heritage, artisan boutiques, and signature exhibits.`,
-          visitingTime: '01:00 PM – 04:00 PM',
-          cost: Math.round(dailyBudget * 0.35),
-          recommendedActivity: 'Museum exploration & traditional artisan craft alley',
-          foodSuggestion: 'Authentic regional lunch platter featuring authentic local flavors',
-          estimatedDistance: '2.4 km via scenic route',
-          lat: +(baseCoord.lat - lngDelta1 * 1.2).toFixed(4),
-          lng: +(baseCoord.lng + latDelta1 * 1.1).toFixed(4),
-        },
-        {
-          name: `${dest} Golden Hour Promenade & Sunset Terrace`,
-          description: `Unwind with picturesque evening light followed by celebrated local cuisine.`,
-          visitingTime: '05:30 PM – 08:30 PM',
-          cost: Math.round(dailyBudget * 0.4),
-          recommendedActivity: 'Sunset panorama walk & rooftop evening relaxation',
-          foodSuggestion: 'Chef tasting dinner with regional wine or signature mocktails',
-          estimatedDistance: '1.5 km scenic stroll',
-          lat: +(baseCoord.lat + lngDelta1 * 0.8).toFixed(4),
-          lng: +(baseCoord.lng - latDelta1 * 0.9).toFixed(4),
-        },
-      ],
+      }),
     });
+    if (!res.ok) return { saved: false };
+    return (await res.json()) as { saved: boolean; relevanceLabel?: number };
+  } catch {
+    return { saved: false };
   }
+}
 
-  return itineraries;
+export async function fetchModelStatus(): Promise<ModelStatusSummary | null> {
+  try {
+    const res = await fetch('/api/admin/model/status', {
+      headers: { Accept: 'application/json' },
+    });
+    if (!res.ok) return null;
+    return await parseBackendResponse<ModelStatusSummary>(res, 'Model status');
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchAttributionInfo(): Promise<AttributionResponse | null> {
+  try {
+    const res = await fetch('/api/attribution', {
+      headers: { Accept: 'application/json' },
+    });
+    if (!res.ok) return null;
+    return await parseBackendResponse<AttributionResponse>(res, 'Attribution info');
+  } catch {
+    return null;
+  }
+}
+
+export async function searchWorldwidePlaces(params: {
+  q?: string;
+  city?: string;
+  countryCode?: string;
+  category?: string;
+  page?: number;
+  limit?: number;
+}): Promise<{ items: DiscoveredAttraction[]; total: number }> {
+  const usp = new URLSearchParams();
+  if (params.q) usp.set('q', params.q);
+  if (params.city) usp.set('city', params.city);
+  if (params.countryCode) usp.set('countryCode', params.countryCode);
+  if (params.category) usp.set('category', params.category);
+  if (params.page) usp.set('page', String(params.page));
+  if (params.limit) usp.set('limit', String(params.limit));
+
+  const res = await fetch(`/api/places/search?${usp.toString()}`, {
+    headers: { Accept: 'application/json' },
+  });
+  const data = await parseBackendResponse<{
+    items: DiscoveredAttraction[];
+    pagination: { total: number };
+  }>(res, 'Places search');
+  return {
+    items: data.items || [],
+    total: data.pagination?.total || 0,
+  };
 }

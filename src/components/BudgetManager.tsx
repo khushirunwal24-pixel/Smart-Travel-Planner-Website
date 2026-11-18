@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   IndianRupee,
   Plus,
@@ -6,30 +6,27 @@ import {
   Edit2,
   AlertTriangle,
   PieChart,
-  Calendar,
-  Tag,
-  FileText,
   Search,
-  Filter,
-  CheckCircle2,
   TrendingDown,
   TrendingUp,
   X,
-  CreditCard,
+  Compass,
 } from 'lucide-react';
-import { Trip, Expense, ExpenseCategory } from '../types';
+import { Trip, Itinerary, Expense, ExpenseCategory, BudgetSummary } from '../types';
 import {
   getExpenses,
   addExpense,
   updateExpense,
   deleteExpense,
   getTrips,
+  getItinerary,
 } from '../services/tripService';
 import { useAuth } from '../context/AuthContext';
 import { formatINR } from '../utils/currency';
 
 interface BudgetManagerProps {
   currentTrip?: Trip | null;
+  currentItinerary?: Itinerary | null;
   onSelectTrip?: (trip: Trip) => void;
   onShowToast: (type: 'success' | 'error' | 'info', title: string, message: string) => void;
 }
@@ -54,6 +51,7 @@ const CATEGORY_COLORS: Record<ExpenseCategory, string> = {
 
 export const BudgetManager: React.FC<BudgetManagerProps> = ({
   currentTrip,
+  currentItinerary,
   onSelectTrip,
   onShowToast,
 }) => {
@@ -62,6 +60,9 @@ export const BudgetManager: React.FC<BudgetManagerProps> = ({
 
   const [trips, setTrips] = useState<Trip[]>([]);
   const [activeTrip, setActiveTrip] = useState<Trip | null>(currentTrip || null);
+  const [activeItinerary, setActiveItinerary] = useState<Itinerary | null>(
+    currentItinerary || null
+  );
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -80,6 +81,14 @@ export const BudgetManager: React.FC<BudgetManagerProps> = ({
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategoryFilter, setSelectedCategoryFilter] = useState<string>('All');
 
+  useEffect(() => {
+    if (currentTrip) setActiveTrip(currentTrip);
+  }, [currentTrip]);
+
+  useEffect(() => {
+    if (currentItinerary) setActiveItinerary(currentItinerary);
+  }, [currentItinerary]);
+
   // Load user trips
   useEffect(() => {
     async function loadUserTrips() {
@@ -92,32 +101,92 @@ export const BudgetManager: React.FC<BudgetManagerProps> = ({
     loadUserTrips();
   }, [userId, isGuest]);
 
-  // Load expenses whenever activeTrip changes
+  // Load expenses and itinerary whenever activeTrip changes
   useEffect(() => {
     if (!activeTrip) {
       setExpenses([]);
       setLoading(false);
       return;
     }
-    async function loadTripExpenses() {
+    async function loadTripFinancials() {
       setLoading(true);
       try {
         const list = await getExpenses(activeTrip!.id, userId, isGuest);
         setExpenses(list);
+
+        if (!currentItinerary || currentItinerary.tripId !== activeTrip!.id) {
+          const it = await getItinerary(activeTrip!.id, userId, isGuest);
+          setActiveItinerary(it);
+        }
       } catch (err) {
         console.error('Failed to load expenses:', err);
       } finally {
         setLoading(false);
       }
     }
-    loadTripExpenses();
-  }, [activeTrip, userId, isGuest]);
+    loadTripFinancials();
+  }, [activeTrip, userId, isGuest, currentItinerary]);
 
-  // Calculate totals
+  // Derive Smart Itinerary Budget Summary from activeItinerary (even for saved itineraries lacking cached summary)
+  const itineraryBudgetSummary: BudgetSummary | null = useMemo(() => {
+    if (!activeItinerary || !activeItinerary.days || activeItinerary.days.length === 0) {
+      return null;
+    }
+    if (activeItinerary.budgetSummary) {
+      return activeItinerary.budgetSummary;
+    }
+    const totalBudgetVal = activeTrip?.budget || 0;
+    const travelersCount = Math.max(1, activeTrip?.travelers || 1);
+    const categoryTotals = {
+      transport: 0,
+      accommodation: 0,
+      food: 0,
+      entranceFees: 0,
+      other: 0,
+    };
+    let unavailablePriceCount = 0;
+
+    const dailyBreakdown = activeItinerary.days.map((d) => {
+      if (d.costBreakdown) {
+        categoryTotals.transport += d.costBreakdown.transport || 0;
+        categoryTotals.accommodation += d.costBreakdown.accommodation || 0;
+        categoryTotals.food += d.costBreakdown.food || 0;
+        categoryTotals.entranceFees += d.costBreakdown.entranceFees || 0;
+        categoryTotals.other += d.costBreakdown.other || 0;
+      } else {
+        categoryTotals.other += d.estimatedCost || 0;
+      }
+      d.locations.forEach((loc) => {
+        if (loc.priceLabel === 'Price unavailable' || (!loc.priceLabel && loc.cost === 0)) {
+          unavailablePriceCount += 1;
+        }
+      });
+      return {
+        dayNumber: d.dayNumber,
+        date: d.date || '',
+        formattedDate: d.formattedDate || `Day ${d.dayNumber}`,
+        amount: d.estimatedCost || 0,
+      };
+    });
+
+    const totalEstimatedExpenditure = dailyBreakdown.reduce((s, d) => s + d.amount, 0);
+    return {
+      totalBudget: totalBudgetVal,
+      totalEstimatedExpenditure,
+      remainingBudget: totalBudgetVal - totalEstimatedExpenditure,
+      perPersonExpenditure: Math.round(totalEstimatedExpenditure / travelersCount),
+      dailyBreakdown,
+      categoryTotals,
+      unavailablePriceCount,
+    };
+  }, [activeItinerary, activeTrip]);
+
+  // Calculate logged expense totals
   const totalBudget = activeTrip?.budget || 0;
   const totalSpent = expenses.reduce((sum, e) => sum + (e.amount || 0), 0);
   const remainingBudget = totalBudget - totalSpent;
-  const spendingPercentage = totalBudget > 0 ? Math.min(200, Math.round((totalSpent / totalBudget) * 100)) : 0;
+  const spendingPercentage =
+    totalBudget > 0 ? Math.min(200, Math.round((totalSpent / totalBudget) * 100)) : 0;
   const isOverBudget = remainingBudget < 0;
 
   // Category breakdown
@@ -227,12 +296,11 @@ export const BudgetManager: React.FC<BudgetManagerProps> = ({
       await deleteExpense(expenseId, isGuest);
       setExpenses((prev) => prev.filter((e) => e.id !== expenseId));
       onShowToast('info', 'Deleted', 'Expense item removed.');
-    } catch (err: any) {
+    } catch {
       onShowToast('error', 'Error', 'Failed to delete expense.');
     }
   };
 
-  // Filtered expenses list
   const filteredExpenses = expenses.filter((e) => {
     const matchesSearch =
       e.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -255,11 +323,11 @@ export const BudgetManager: React.FC<BudgetManagerProps> = ({
             Trip Budget Management
           </h1>
           <p className="text-xs text-slate-500 mt-1">
-            Track allocations, monitor expenditures, and prevent unexpected overspending.
+            Compare planned itinerary expenditures against logged expenses and prevent overspending.
           </p>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-3 flex-wrap">
           {trips.length > 0 && (
             <select
               value={activeTrip?.id || ''}
@@ -296,19 +364,19 @@ export const BudgetManager: React.FC<BudgetManagerProps> = ({
           <div className="flex-1 text-xs">
             <h4 className="font-bold text-rose-900 text-sm">Budget Exceeded Alert</h4>
             <p className="mt-0.5">
-              You have exceeded your planned budget of <strong>{formatINR(totalBudget)}</strong> by{' '}
-              <strong className="underline">{formatINR(Math.abs(remainingBudget))}</strong>. Consider trimming upcoming activity costs or adjusting your budget limit.
+              Your logged expenses have exceeded your planned budget of{' '}
+              <strong>{formatINR(totalBudget)}</strong> by{' '}
+              <strong className="underline">{formatINR(Math.abs(remainingBudget))}</strong>.
             </p>
           </div>
         </div>
       )}
 
-      {/* Metric Cards (Total Budget, Actual Spending, Remaining Budget, Health) */}
+      {/* Metric Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        {/* Total Budget */}
         <div className="bg-white p-5 rounded-3xl border border-slate-200/80 shadow-xs">
           <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
-            Total Estimated Budget
+            Total Planned Budget
           </span>
           <div className="mt-2 flex items-baseline justify-between">
             <div className="text-2xl font-extrabold text-slate-900 font-heading">
@@ -318,13 +386,14 @@ export const BudgetManager: React.FC<BudgetManagerProps> = ({
               <IndianRupee className="w-4 h-4" />
             </div>
           </div>
-          <p className="text-[11px] text-slate-400 mt-2">Target expenditure ceiling</p>
+          <p className="text-[11px] text-slate-400 mt-2">
+            {activeTrip?.travelers || 1} traveler(s) target limit
+          </p>
         </div>
 
-        {/* Actual Spending */}
         <div className="bg-white p-5 rounded-3xl border border-slate-200/80 shadow-xs">
           <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
-            Actual Spending
+            Actual Logged Spending
           </span>
           <div className="mt-2 flex items-baseline justify-between">
             <div className="text-2xl font-extrabold text-slate-900 font-heading">
@@ -337,7 +406,6 @@ export const BudgetManager: React.FC<BudgetManagerProps> = ({
           <p className="text-[11px] text-slate-400 mt-2">{expenses.length} transactions recorded</p>
         </div>
 
-        {/* Remaining Budget */}
         <div className="bg-white p-5 rounded-3xl border border-slate-200/80 shadow-xs">
           <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
             Remaining Balance
@@ -355,7 +423,11 @@ export const BudgetManager: React.FC<BudgetManagerProps> = ({
                 isOverBudget ? 'bg-rose-50 text-rose-600' : 'bg-emerald-50 text-emerald-600'
               }`}
             >
-              {isOverBudget ? <AlertTriangle className="w-4 h-4" /> : <TrendingDown className="w-4 h-4" />}
+              {isOverBudget ? (
+                <AlertTriangle className="w-4 h-4" />
+              ) : (
+                <TrendingDown className="w-4 h-4" />
+              )}
             </div>
           </div>
           <p className="text-[11px] text-slate-400 mt-2">
@@ -363,7 +435,6 @@ export const BudgetManager: React.FC<BudgetManagerProps> = ({
           </p>
         </div>
 
-        {/* Budget Burn Progress */}
         <div className="bg-white p-5 rounded-3xl border border-slate-200/80 shadow-xs flex flex-col justify-between">
           <div>
             <div className="flex items-center justify-between text-[11px] font-bold text-slate-700 mb-1">
@@ -395,13 +466,96 @@ export const BudgetManager: React.FC<BudgetManagerProps> = ({
         </div>
       </div>
 
+      {/* Smart Estimated Trip Budget from Itinerary */}
+      {itineraryBudgetSummary && (
+        <div className="bg-white p-6 rounded-3xl border border-slate-200/80 shadow-xs space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-100">
+            <div className="flex items-center gap-2">
+              <div className="w-8 h-8 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center">
+                <Compass className="w-4 h-4" />
+              </div>
+              <div>
+                <h3 className="text-base font-bold text-slate-900 font-heading">
+                  Itinerary Estimated Trip Expenditure ({activeItinerary?.destination})
+                </h3>
+                <p className="text-[11px] text-slate-500">
+                  Day-wise transport, accommodation, meals, and OpenStreetMap entrance fees
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-3 text-xs">
+              <span className="px-3 py-1 rounded-full bg-slate-100 text-slate-800 font-bold">
+                Est. Total: {formatINR(itineraryBudgetSummary.totalEstimatedExpenditure)}
+              </span>
+              <span className="px-3 py-1 rounded-full bg-blue-50 text-blue-700 font-bold">
+                Per Person: {formatINR(itineraryBudgetSummary.perPersonExpenditure)}
+              </span>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-xs">
+            <div className="p-3 rounded-2xl bg-blue-50/60 border border-blue-100">
+              <span className="text-[11px] text-slate-500 block">Transportation (est.)</span>
+              <strong className="text-sm text-slate-900">
+                {formatINR(itineraryBudgetSummary.categoryTotals.transport)}
+              </strong>
+            </div>
+            <div className="p-3 rounded-2xl bg-teal-50/60 border border-teal-100">
+              <span className="text-[11px] text-slate-500 block">Accommodation (est.)</span>
+              <strong className="text-sm text-slate-900">
+                {formatINR(itineraryBudgetSummary.categoryTotals.accommodation)}
+              </strong>
+            </div>
+            <div className="p-3 rounded-2xl bg-amber-50/60 border border-amber-100">
+              <span className="text-[11px] text-slate-500 block">Food & Dining (est.)</span>
+              <strong className="text-sm text-slate-900">
+                {formatINR(itineraryBudgetSummary.categoryTotals.food)}
+              </strong>
+            </div>
+            <div className="p-3 rounded-2xl bg-purple-50/60 border border-purple-100">
+              <span className="text-[11px] text-slate-500 block">Attraction Tickets (OSM)</span>
+              <strong className="text-sm text-slate-900">
+                {formatINR(itineraryBudgetSummary.categoryTotals.entranceFees)}
+              </strong>
+            </div>
+            <div className="p-3 rounded-2xl bg-slate-50 border border-slate-200/80">
+              <span className="text-[11px] text-slate-500 block">Other (est.)</span>
+              <strong className="text-sm text-slate-900">
+                {formatINR(itineraryBudgetSummary.categoryTotals.other)}
+              </strong>
+            </div>
+          </div>
+
+          {/* Daily Expenditure Chips */}
+          <div className="flex flex-wrap gap-2">
+            {itineraryBudgetSummary.dailyBreakdown.map((d) => (
+              <div
+                key={d.dayNumber}
+                className="px-3 py-1.5 rounded-xl bg-slate-50 border border-slate-200/70 text-[11px] flex items-center gap-2"
+              >
+                <span className="font-bold text-slate-700">
+                  Day {d.dayNumber} ({d.formattedDate})
+                </span>
+                <span className="font-extrabold text-teal-700">{formatINR(d.amount)}</span>
+              </div>
+            ))}
+          </div>
+
+          {itineraryBudgetSummary.unavailablePriceCount > 0 && (
+            <p className="text-[11px] text-slate-500">
+              Note: {itineraryBudgetSummary.unavailablePriceCount} attraction(s) in this itinerary have ticket prices listed as{' '}
+              <strong className="text-slate-700">"Price unavailable"</strong> on OpenStreetMap and are excluded from fake pricing estimates.
+            </p>
+          )}
+        </div>
+      )}
+
       {/* Category Breakdown Charts */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Category Spending Bars */}
         <div className="lg:col-span-2 bg-white p-6 rounded-3xl border border-slate-200/80 shadow-xs space-y-4">
           <div className="flex items-center justify-between">
             <h3 className="text-base font-bold text-slate-900 font-heading">
-              Category-Wise Spending Breakdown
+              Logged Expense Breakdown by Category
             </h3>
             <span className="text-xs text-slate-400">Total: {formatINR(totalSpent)}</span>
           </div>
@@ -416,7 +570,10 @@ export const BudgetManager: React.FC<BudgetManagerProps> = ({
                 <div key={cat} className="space-y-1">
                   <div className="flex items-center justify-between text-xs font-semibold text-slate-700">
                     <span className="flex items-center gap-1.5">
-                      <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: color }} />
+                      <span
+                        className="w-2.5 h-2.5 rounded-full"
+                        style={{ backgroundColor: color }}
+                      />
                       {cat}
                     </span>
                     <span className="text-slate-900 font-bold">
@@ -436,7 +593,7 @@ export const BudgetManager: React.FC<BudgetManagerProps> = ({
           </div>
         </div>
 
-        {/* Quick Travel Budget Tips */}
+        {/* Smart Travel Budget Optimizer */}
         <div className="bg-slate-900 text-white p-6 rounded-3xl shadow-xl flex flex-col justify-between">
           <div>
             <div className="w-10 h-10 rounded-2xl bg-teal-500/20 text-teal-400 flex items-center justify-center mb-3">
@@ -444,7 +601,7 @@ export const BudgetManager: React.FC<BudgetManagerProps> = ({
             </div>
             <h3 className="text-base font-bold font-heading">Smart Budget Optimizer</h3>
             <p className="text-xs text-slate-300 mt-2 leading-relaxed">
-              Based on your destination and traveler count, standard budget allocations recommend:
+              Recommended allocation benchmarks for balanced multi-day trips:
             </p>
             <div className="mt-4 space-y-2 text-xs text-slate-300">
               <div className="flex justify-between border-b border-slate-800 pb-1.5">
@@ -452,7 +609,7 @@ export const BudgetManager: React.FC<BudgetManagerProps> = ({
                 <span className="font-semibold text-teal-400">35% - 40%</span>
               </div>
               <div className="flex justify-between border-b border-slate-800 pb-1.5">
-                <span>Flights / Transit</span>
+                <span>Flights / Train / Transit</span>
                 <span className="font-semibold text-blue-400">25% - 30%</span>
               </div>
               <div className="flex justify-between border-b border-slate-800 pb-1.5">
@@ -460,21 +617,20 @@ export const BudgetManager: React.FC<BudgetManagerProps> = ({
                 <span className="font-semibold text-amber-400">20%</span>
               </div>
               <div className="flex justify-between pb-1.5">
-                <span>Activities & Souvenirs</span>
+                <span>Tickets & Activities</span>
                 <span className="font-semibold text-pink-400">10% - 15%</span>
               </div>
             </div>
           </div>
 
           <div className="mt-6 pt-4 border-t border-slate-800 text-[11px] text-slate-400">
-            Keep receipts photographed and logged daily to avoid surprise bank exchange charges.
+            Log actual receipts daily to compare planned itinerary estimates against real spending.
           </div>
         </div>
       </div>
 
-      {/* Expense History Table with Search and Filters */}
+      {/* Expense History Table */}
       <div className="bg-white rounded-3xl border border-slate-200/80 shadow-xs overflow-hidden">
-        {/* Table Filters Toolbar */}
         <div className="p-5 border-b border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div className="flex items-center gap-2">
             <h3 className="text-base font-bold text-slate-900 font-heading">Expense History</h3>
@@ -484,7 +640,6 @@ export const BudgetManager: React.FC<BudgetManagerProps> = ({
           </div>
 
           <div className="flex items-center gap-2 flex-wrap">
-            {/* Search Input */}
             <div className="relative">
               <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
               <input
@@ -496,7 +651,6 @@ export const BudgetManager: React.FC<BudgetManagerProps> = ({
               />
             </div>
 
-            {/* Category Filter */}
             <select
               value={selectedCategoryFilter}
               onChange={(e) => setSelectedCategoryFilter(e.target.value)}
@@ -512,7 +666,6 @@ export const BudgetManager: React.FC<BudgetManagerProps> = ({
           </div>
         </div>
 
-        {/* Table */}
         <div className="overflow-x-auto">
           <table className="w-full text-left text-xs">
             <thead className="bg-slate-50/80 text-slate-500 uppercase tracking-wider font-semibold border-b border-slate-100">
@@ -526,44 +679,54 @@ export const BudgetManager: React.FC<BudgetManagerProps> = ({
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 text-slate-700">
-              {filteredExpenses.map((exp) => (
-                <tr key={exp.id} className="hover:bg-slate-50/70 transition-colors">
-                  <td className="py-3.5 px-4 font-semibold text-slate-900">{exp.title}</td>
-                  <td className="py-3.5 px-4">
-                    <span
-                      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold text-white"
-                      style={{ backgroundColor: CATEGORY_COLORS[exp.category] || '#64748B' }}
-                    >
-                      {exp.category}
-                    </span>
-                  </td>
-                  <td className="py-3.5 px-4 text-slate-500">{exp.date}</td>
-                  <td className="py-3.5 px-4 text-slate-500 max-w-xs truncate">{exp.notes || '—'}</td>
-                  <td className="py-3.5 px-4 text-right font-bold text-slate-900">
-                    {formatINR(exp.amount)}
-                  </td>
-                  <td className="py-3.5 px-4 text-right">
-                    <div className="flex items-center justify-end gap-1.5">
-                      <button
-                        onClick={() => handleOpenEditModal(exp)}
-                        className="p-1.5 rounded-lg text-slate-400 hover:text-blue-600 hover:bg-blue-50 transition-colors"
-                        title="Edit expense"
-                      >
-                        <Edit2 className="w-3.5 h-3.5" />
-                      </button>
-                      <button
-                        onClick={() => handleDeleteExpense(exp.id)}
-                        className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors"
-                        title="Delete expense"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
+              {loading ? (
+                <tr>
+                  <td colSpan={6} className="text-center py-8 text-slate-400 text-xs">
+                    Loading expenses...
                   </td>
                 </tr>
-              ))}
+              ) : (
+                filteredExpenses.map((exp) => (
+                  <tr key={exp.id} className="hover:bg-slate-50/70 transition-colors">
+                    <td className="py-3.5 px-4 font-semibold text-slate-900">{exp.title}</td>
+                    <td className="py-3.5 px-4">
+                      <span
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold text-white"
+                        style={{ backgroundColor: CATEGORY_COLORS[exp.category] || '#64748B' }}
+                      >
+                        {exp.category}
+                      </span>
+                    </td>
+                    <td className="py-3.5 px-4 text-slate-500">{exp.date}</td>
+                    <td className="py-3.5 px-4 text-slate-500 max-w-xs truncate">
+                      {exp.notes || '—'}
+                    </td>
+                    <td className="py-3.5 px-4 text-right font-bold text-slate-900">
+                      {formatINR(exp.amount)}
+                    </td>
+                    <td className="py-3.5 px-4 text-right">
+                      <div className="flex items-center justify-end gap-1.5">
+                        <button
+                          onClick={() => handleOpenEditModal(exp)}
+                          className="p-1.5 rounded-lg text-slate-400 hover:text-blue-600 hover:bg-blue-50 transition-colors"
+                          title="Edit expense"
+                        >
+                          <Edit2 className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          onClick={() => handleDeleteExpense(exp.id)}
+                          className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors"
+                          title="Delete expense"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))
+              )}
 
-              {filteredExpenses.length === 0 && (
+              {!loading && filteredExpenses.length === 0 && (
                 <tr>
                   <td colSpan={6} className="text-center py-12 text-slate-400 text-xs">
                     <IndianRupee className="w-8 h-8 text-slate-300 mx-auto mb-2" />
@@ -605,7 +768,7 @@ export const BudgetManager: React.FC<BudgetManagerProps> = ({
                   type="text"
                   value={title}
                   onChange={(e) => setTitle(e.target.value)}
-                  placeholder="e.g. Louvre Museum Tickets, Dinner Bistro"
+                  placeholder="e.g. City Palace Entry Tickets, Dinner"
                   required
                   className="w-full px-3 py-2 text-xs rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-600"
                 />
@@ -622,7 +785,7 @@ export const BudgetManager: React.FC<BudgetManagerProps> = ({
                     min="1"
                     value={amount}
                     onChange={(e) => setAmount(e.target.value)}
-                    placeholder="e.g. 3500"
+                    placeholder="e.g. 1200"
                     required
                     className="w-full px-3 py-2 text-xs rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-600"
                   />
@@ -665,7 +828,7 @@ export const BudgetManager: React.FC<BudgetManagerProps> = ({
                   value={notes}
                   onChange={(e) => setNotes(e.target.value)}
                   rows={2}
-                  placeholder="e.g. Paid in EUR via credit card"
+                  placeholder="e.g. Paid via UPI"
                   className="w-full px-3 py-2 text-xs rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-600"
                 />
               </div>

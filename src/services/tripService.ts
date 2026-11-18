@@ -352,12 +352,56 @@ export async function deleteTrip(tripId: string, isGuest = false): Promise<void>
   }
 }
 
+const ITINERARY_META_KEY = 'stp_itinerary_meta_v1';
+
+interface ItineraryExtraMeta {
+  discoveredAttractions?: Itinerary['discoveredAttractions'];
+  budgetSummary?: Itinerary['budgetSummary'];
+}
+
+function getItineraryMeta(tripId: string): ItineraryExtraMeta {
+  try {
+    const raw = localStorage.getItem(ITINERARY_META_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, ItineraryExtraMeta>;
+    return parsed[tripId] || {};
+  } catch {
+    return {};
+  }
+}
+
+function saveItineraryMeta(tripId: string, meta: ItineraryExtraMeta) {
+  try {
+    const raw = localStorage.getItem(ITINERARY_META_KEY);
+    const parsed: Record<string, ItineraryExtraMeta> = raw ? JSON.parse(raw) : {};
+    // Strip heavy osmTags before caching in localStorage
+    const compactAttractions = (meta.discoveredAttractions || []).map((a) => ({
+      ...a,
+      osmTags: {},
+    }));
+    parsed[tripId] = {
+      discoveredAttractions: compactAttractions,
+      budgetSummary: meta.budgetSummary,
+    };
+    localStorage.setItem(ITINERARY_META_KEY, JSON.stringify(parsed));
+  } catch {
+    // Ignore storage quota issues
+  }
+}
+
 // Itinerary Service APIs
 export async function getItinerary(tripId: string, userId: string, isGuest = false): Promise<Itinerary | null> {
+  const extraMeta = getItineraryMeta(tripId);
+
   if (isGuest || userId.startsWith('guest_')) {
     const list = getLocalData<Itinerary>(GUEST_ITINERARIES_KEY, [SEED_ITINERARY_PARIS]);
     const found = list.find((it) => it.tripId === tripId);
-    return found || null;
+    if (!found) return null;
+    return {
+      ...found,
+      discoveredAttractions: found.discoveredAttractions || extraMeta.discoveredAttractions,
+      budgetSummary: found.budgetSummary || extraMeta.budgetSummary,
+    };
   }
 
   const itRef = doc(db, 'itineraries', `itinerary_${tripId}`);
@@ -378,6 +422,8 @@ export async function getItinerary(tripId: string, userId: string, isGuest = fal
         destination: data.destination,
         totalDays: data.totalDays,
         days,
+        discoveredAttractions: extraMeta.discoveredAttractions,
+        budgetSummary: extraMeta.budgetSummary,
         createdAt: data.createdAt,
         updatedAt: data.updatedAt,
       };
@@ -390,7 +436,14 @@ export async function getItinerary(tripId: string, userId: string, isGuest = fal
       // Diagnostic logged via handleFirestoreError
     }
     const list = getLocalData<Itinerary>(GUEST_ITINERARIES_KEY, [SEED_ITINERARY_PARIS]);
-    return list.find((it) => it.tripId === tripId) || null;
+    const found = list.find((it) => it.tripId === tripId);
+    return found
+      ? {
+          ...found,
+          discoveredAttractions: found.discoveredAttractions || extraMeta.discoveredAttractions,
+          budgetSummary: found.budgetSummary || extraMeta.budgetSummary,
+        }
+      : null;
   }
 }
 
@@ -399,10 +452,29 @@ export async function saveItinerary(
   userId: string,
   destination: string,
   days: DayItinerary[],
-  isGuest = false
+  isGuest = false,
+  extra?: ItineraryExtraMeta
 ): Promise<Itinerary> {
   const id = `itinerary_${tripId}`;
   const now = new Date().toISOString();
+
+  if (extra) {
+    saveItineraryMeta(tripId, extra);
+  }
+
+  // Ensure daysJson comfortably stays under Firestore's 50,000 char blueprint rule
+  let serializedDays = JSON.stringify(days);
+  if (serializedDays.length > 48000) {
+    const trimmed = days.map((d) => ({
+      ...d,
+      locations: d.locations.map((loc) => ({
+        ...loc,
+        description: loc.description.slice(0, 160),
+      })),
+    }));
+    serializedDays = JSON.stringify(trimmed);
+  }
+
   const itinerary: Itinerary = {
     id,
     tripId,
@@ -410,6 +482,8 @@ export async function saveItinerary(
     destination,
     totalDays: days.length,
     days,
+    discoveredAttractions: extra?.discoveredAttractions,
+    budgetSummary: extra?.budgetSummary,
     createdAt: now,
     updatedAt: now,
   };
@@ -428,7 +502,7 @@ export async function saveItinerary(
       userId,
       destination,
       totalDays: days.length,
-      daysJson: JSON.stringify(days),
+      daysJson: serializedDays,
       createdAt: now,
       updatedAt: now,
     });

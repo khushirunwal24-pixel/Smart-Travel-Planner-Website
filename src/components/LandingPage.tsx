@@ -43,8 +43,8 @@ export const LandingPage: React.FC<LandingProps> = ({
   const handleHeroSearch = (e: React.FormEvent) => {
     e.preventDefault();
     onStartPlanning({
-      destination: dest || 'Tokyo, Japan',
-      startLocation: origin || 'New Delhi, India',
+      destination: dest.trim() || 'Jaipur, India',
+      startLocation: origin.trim() || 'New Delhi, India',
       startDate: startDate || new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0],
       endDate: endDate || new Date(Date.now() + 12 * 86400000).toISOString().split('T')[0],
       travelers: travelers || 2,
@@ -301,7 +301,7 @@ export const LandingPage: React.FC<LandingProps> = ({
       </section>
 
       {/* Explore Popular Destinations Section */}
-      <section className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+      <section id="explore" className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 scroll-mt-20">
         <div className="flex flex-col md:flex-row md:items-end justify-between mb-10">
           <div>
             <span className="text-xs font-bold text-blue-600 uppercase tracking-widest font-heading">
